@@ -1,0 +1,11 @@
+import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
+import { stripRegionsPlugin } from "./src/build/stripRegions.js";
+
+export default defineConfig({
+  // Separate config from vite.config.js, so the build flag is defined here too.
+  define: { __PUBLIC__: JSON.stringify(true) },
+  plugins: [stripRegionsPlugin(true)],
+  test: { environment: "node", include: ["src/**/*.test.js", "src/**/*.test.ts"] },
+  resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
+});

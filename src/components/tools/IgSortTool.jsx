@@ -1,0 +1,863 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Download,
+  Bookmark,
+  ArrowUp,
+  ArrowDown,
+  Heart,
+  MessageCircle,
+  Eye,
+  Zap,
+  Repeat2,
+  Calendar,
+  Play,
+  Images,
+  Image as ImageIcon,
+  ImageDown,
+  FileText,
+  Loader2,
+  Copy,
+  Check,
+  X,
+  RotateCw,
+  Trash2,
+  Square,
+  ChevronsDown,
+  MessagesSquare,
+  Sheet,
+  Users,
+  Captions,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
+import { ToolBar, ActionButton, ToolIconButton, ToolSelect } from "@/components/ui/ToolBar";
+import ContentLinkBanner from "@/components/ui/ContentLinkBanner";
+import { useContentLink } from "@/lib/useContentLink";
+import { startPolling } from "@/lib/poll";
+import SurfacePicker, { FOLLOW, resolveSurface } from "@/components/ui/SurfacePicker";
+import { surfaceFileTag } from "@/lib/surfaceLabel";
+import { useItemStatus, statusKey, statusTitle } from "@/lib/useItemStatus";
+import useStagger from "@/lib/useStagger";
+import useStoredFlag from "@/lib/useStoredFlag";
+import useFeedQuery from "@/lib/useFeedQuery";
+import QueryBuilder from "@/components/ui/QueryBuilder";
+import MetricLegend from "@/components/ui/MetricLegend";
+import { applyQuery, primarySort, withPrimarySort, isSortableField } from "@/lib/shared/feedQuery";
+import { IG_QUERY_FIELDS } from "@/lib/shared/igQuery";
+import { requireOk, sendBg } from "@/lib/bg";
+import { commentSweepTargets } from "@/lib/igComments";
+import { buildSavedEntry } from "@/lib/shared/savedEntry";
+import { readStoredTranscriptLanguage } from "@/lib/transcriptionLanguage.js";
+import { bulkTranscribeTargets, tidyTranscriptText, txButtonState } from "@/lib/transcriptJobs.js";
+import IconBtn from "@/components/ui/IconBtn";
+import { normalizeErWeights, ER_WEIGHTS, ER_WEIGHTS_KEY } from "@/lib/shared/igFilters.js";
+// Date window + scroll cadence are platform-neutral and now live apart from the
+// Instagram-only knobs; the TikTok tool reads the same module.
+import { DATE_RANGES, withinDateRange } from "@/lib/shared/harvest.js";
+import { buildXlsx } from "@/lib/xlsx.js";
+import { downloadPath } from "@/lib/downloadPath";
+import {
+  recordToCard,
+  filenameFor,
+  thumbFilenameFor,
+  extFromUrl,
+  fmtCount,
+  filterBySurface,
+  engagementRate,
+  fmtER,
+} from "@/lib/igMedia";
+
+// The sort select's options come from the query's field map, so a key picked on
+// the page's own sort bar (which lists every sortable field) always shows here.
+// `short` is the word the trigger falls back to once the row is too narrow.
+const SORT_OPTS = [
+  { value: "default", label: "Padrão" },
+  ...Object.entries(IG_QUERY_FIELDS)
+    .filter(([, f]) => isSortableField(f))
+    .map(([value, f]) => ({ value, label: f.label, short: f.short })),
+];
+const TYPE_ICON = { carousel: Images, video: Play, photo: ImageIcon };
+
+// Small frosted icon button overlaid on a card thumbnail.
+// Instagram Sort + Download. Reads the passive JSON.parse capture (via the IG
+// content bridge, FBW_IG_LIST), sorts it in-panel as a 2-col grid of 9:16 cards
+// with a right-side stat rail, and downloads media/thumbnail via FBW_DL_MEDIA.
+export default function IgSortTool() {
+  const [records, setRecords] = useState([]);
+  const [surface, setSurface] = useState(null);
+  // Which page the grid shows. FOLLOW re-points itself as you browse (the
+  // default); a hand-picked surface stays pinned; ALL drops the scoping.
+  const [pick, setPick] = useState(FOLLOW);
+  const [surfaces, setSurfaces] = useState([]);
+  // Sort + filters, shared with the bar on instagram.com (sw_ig_query): sorting
+  // here reorders the site's own grid, and the other way round.
+  const [query, setQuery] = useFeedQuery("sw_ig_query", IG_QUERY_FIELDS);
+  const { key: sortKey, dir: sortDir } = primarySort(query);
+  const setSortKey = (k) => setQuery((q) => withPrimarySort(q, k, primarySort(q).dir));
+  const toggleSortDir = () =>
+    setQuery((q) => {
+      const p = primarySort(q);
+      return p.key === "default" ? q : withPrimarySort(q, p.key, p.dir === "desc" ? "asc" : "desc");
+    });
+  // Item 4: a hashtag search is mostly old posts — "what worked lately" needs a
+  // window, not just an ordering.
+  const [dateRange, setDateRange] = useState("all");
+  // Item 5: ER weights are a setting now. Stored in local storage so the on-page
+  // overlay recomputes with the same numbers the panel sorts by.
+  const [erW, setErW] = useState(ER_WEIGHTS);
+  useEffect(() => {
+    chrome.storage?.local?.get?.(ER_WEIGHTS_KEY, (r) => setErW(normalizeErWeights(r && r[ER_WEIGHTS_KEY])));
+  }, []);
+  const setWeight = (k, v) => {
+    // "" is what the field holds mid-retype, and Number("") is 0 — finite and >= 0,
+    // so it passed normalizeErWeights' guard and silently zeroed that term (then
+    // rewrote the input to "0", which the user had to delete as well). An empty
+    // field means "no opinion": fall back to the default for that weight.
+    const raw = v === "" || v == null ? undefined : v;
+    const next = normalizeErWeights({ ...erW, [k]: raw });
+    setErW(next);
+    chrome.storage?.local?.set?.({ [ER_WEIGHTS_KEY]: next });
+  };
+  // The Opções modal toggles this same key, so it is read through the shared hook
+  // rather than latched at mount — otherwise turning the overlay off there left
+  // this switch showing "ligado" until the tool remounted.
+  const [overlay, toggleOverlay] = useStoredFlag("sw_ig_overlay");
+  const { link, noTab, fixing, send, revive, openTab } = useContentLink("instagram");
+
+  // Live mirrors of the shared stores: transcript status per post (spinner /
+  // green / red on the card button; green opens the transcript) and saved ids
+  // (yellow-filled bookmark). Both update via storage.onChanged.
+  const [txMap, setTxMap] = useState({});
+  const [savedIds, setSavedIds] = useState({});
+  const [txModal, setTxModal] = useState(null); // { id, username, text }
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!chrome?.storage?.local) return;
+    const load = () =>
+      chrome.storage.local.get(["fbw_transcripts", "fbw_saved"], (r) => {
+        const m = r.fbw_transcripts || {};
+        const out = {};
+        // A queued job is as busy as a running one for this button (spinner, disabled).
+        for (const k in m) out[k] = txButtonState(m[k].status);
+        setTxMap(out);
+        const s = {};
+        for (const k in r.fbw_saved || {}) s[k] = true;
+        setSavedIds(s);
+      });
+    load();
+    const onCh = (c, area) => {
+      if (area === "local" && (c.fbw_transcripts || c.fbw_saved)) load();
+    };
+    chrome.storage.onChanged.addListener(onCh);
+    return () => chrome.storage.onChanged.removeListener(onCh);
+  }, []);
+
+  const listFromTab = useCallback(async () => {
+    const res = await send({ type: "FBW_IG_LIST" });
+    if (res && Array.isArray(res.records)) {
+      setRecords(res.records);
+      setSurface(res.surface || null);
+      if (Array.isArray(res.surfaces)) setSurfaces(res.surfaces);
+    }
+  }, [send]);
+
+  useEffect(() => {
+    return startPolling(listFromTab, 2500); // skips ticks while the panel is hidden
+  }, [listFromTab]);
+
+  // Drop everything captured so far (other profiles/hashtags) and re-pull the
+  // current surface — so switching context doesn't leave stale posts in the grid.
+  const refresh = useCallback(async () => {
+    setRecords([]);
+    setSurfaces([]);
+    // A pinned page that no longer has any captures would leave the grid empty
+    // with no hint why, so a clear also hands the picker back to the live page.
+    setPick(FOLLOW);
+    // userAction: the user pressed Atualizar and is owed an answer either way.
+    await send({ type: "FBW_IG_CLEAR" }, { userAction: true, action: "limpar a captura" });
+    listFromTab();
+  }, [send, listFromTab]);
+
+  // FBW_IG_CLEAR is platform-global: it empties the capture behind every Instagram
+  // pane, not just this one. So Atualizar arms on the first tap and only clears on
+  // the second — the same two-step the Library's "limpar tudo" uses.
+  const [clearArmed, setClearArmed] = useState(false);
+  const clearBtnRef = useRef(null);
+  useEffect(() => {
+    if (!clearArmed) return;
+    const timer = setTimeout(() => setClearArmed(false), 4000);
+    // Capture phase, so a handler that stops propagation can't leave it armed.
+    const disarm = (e) => { if (!clearBtnRef.current?.contains(e.target)) setClearArmed(false); };
+    document.addEventListener("pointerdown", disarm, true);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("pointerdown", disarm, true);
+    };
+  }, [clearArmed]);
+  const onClearTap = () => {
+    if (!clearArmed) { setClearArmed(true); return; }
+    setClearArmed(false);
+    refresh();
+  };
+
+  const view = resolveSurface(pick, surface);
+  const scopedAll = filterBySurface(records, view);
+  const scoped = scopedAll.filter((r) => withinDateRange(r.taken_at, dateRange));
+  const sorted = applyQuery(scoped, query, IG_QUERY_FIELDS, { weights: erW });
+  const stagger = useStagger(`${JSON.stringify(query)}|${dateRange}|${view}`);
+
+  // Per-action status. The key is namespaced per action: a failed COVER download
+  // used to share the record's key and so painted the media-download icon red.
+  const { run, statusOf, errorOf } = useItemStatus();
+
+  async function downloadRecord(rec) {
+    const id = rec.code || rec.pk;
+    await run(statusKey(id), async () => {
+      if (rec.media_type === "carousel" && Array.isArray(rec.carousel)) {
+        let i = 0;
+        for (const child of rec.carousel) {
+          i += 1;
+          const isVid = child.media_type === "video" && child.video;
+          const url = isVid ? child.video : child.image;
+          if (!url) continue;
+          await requireOk({
+            type: "FBW_DL_MEDIA",
+            kind: isVid ? "video" : "image",
+            url,
+            filename: filenameFor(rec, extFromUrl(url, isVid ? "video" : "image"), i),
+          });
+        }
+      } else if (rec.video) {
+        await requireOk({
+          type: "FBW_DL_MEDIA",
+          kind: "video",
+          url: rec.video,
+          filename: filenameFor(rec, extFromUrl(rec.video, "video")),
+        });
+      } else if (rec.image) {
+        await requireOk({
+          type: "FBW_DL_MEDIA",
+          kind: "image",
+          url: rec.image,
+          filename: filenameFor(rec, extFromUrl(rec.image, "image")),
+        });
+      } else {
+        throw new Error("nenhuma mídia neste registro");
+      }
+    });
+  }
+
+  // Download just the cover image (thumbnail), suffixed -thumb. Its own status key
+  // ("<id>:thumb") so a cover failure marks THIS button, not the media one.
+  async function downloadThumb(rec) {
+    const id = rec.code || rec.pk;
+    const url = rec.image || rec.thumb;
+    if (!url) return;
+    const ext = extFromUrl(url, "image");
+    // The -thumb suffix marks the cover; the bucket follows the media kind.
+    await run(statusKey(id, "thumb"), () =>
+      requireOk({ type: "FBW_DL_MEDIA", kind: "image", url, filename: thumbFilenameFor(rec, ext) }),
+    );
+  }
+
+  // The 400 ms gap below is the whole reason this run has to be exclusive: a
+  // second loop started on top of it would interleave and double the requests the
+  // gap exists to spare the CDN. So one run at a time, and the button becomes its
+  // own stop control — it cannot simply be `disabled` while running or a long run
+  // would have no way out.
+  const [bulk, setBulk] = useState(null); // { done, total, stopping } while running
+  const stopBulkRef = useRef(false);
+
+  async function downloadAll() {
+    if (bulk) return;
+    stopBulkRef.current = false;
+    setBulk({ done: 0, total: sorted.length, stopping: false });
+    try {
+      for (const rec of sorted) {
+        if (stopBulkRef.current) break;
+        await downloadRecord(rec);
+        setBulk((b) => (b ? { ...b, done: b.done + 1 } : b));
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    } finally {
+      setBulk(null);
+    }
+  }
+
+  // Cooperative: the loop is mid-await on a download, so it can only honour this
+  // between items. A ref, not state — the running loop's closure would never see
+  // a state update.
+  function stopBulk() {
+    stopBulkRef.current = true;
+    setBulk((b) => (b ? { ...b, stopping: true } : b));
+  }
+
+  // "Transcrever todos": queues every listed video without a transcript. The
+  // worker runs one Whisper job at a time and ignores a video already queued, so
+  // this only hands it the list; each finished transcript also reaches the
+  // Instagram Scraper destinations (the old bridge's batch transcription).
+  const [txBulk, setTxBulk] = useState(false);
+  async function transcribeAll() {
+    if (txBulk) return;
+    setTxBulk(true);
+    try {
+      for (const rec of bulkTranscribeTargets(sorted, txMap)) {
+        await transcribe(rec);
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    } finally {
+      setTxBulk(false);
+    }
+  }
+
+  // "Comentários de todos": the background opens each listed post (with
+  // comments, at most 15) in a tab of its own, 20–40 s apart, and reads its
+  // thread; the comments land in Comentários and go to the Instagram Scraper
+  // destinations like any capture. A tap while it runs stops it.
+  const [sweep, setSweep] = useState(null);
+  useEffect(() => {
+    if (!sweep?.running) return;
+    const timer = setInterval(async () => {
+      const res = await sendBg({ type: "FBW_IG_COMMENT_SWEEP_STATUS" });
+      if (res.ok) setSweep(res.status);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [sweep?.running]);
+  async function sweepComments() {
+    const res = sweep?.running
+      ? await sendBg({ type: "FBW_IG_COMMENT_SWEEP_STOP" })
+      : await sendBg({ type: "FBW_IG_COMMENT_SWEEP", codes: commentSweepTargets(sorted) });
+    if (res.ok || res.status) setSweep(res.status);
+  }
+
+  // Toggle: first tap saves to the shared Library, second removes. The write
+  // itself belongs to the background, which serializes it — a read-modify-write
+  // here would drop the page overlay's concurrent save. The background decides
+  // insert-vs-remove from the id, and answers with the state AFTER the toggle.
+  async function saveToLibrary(rec) {
+    const id = rec.code || rec.pk;
+    try {
+      const entry = buildSavedEntry({
+        id,
+        platform: "instagram",
+        thumb: rec.thumb || rec.image,
+        caption: rec.caption,
+        // username before full_name — the precedence this pane has always used.
+        authorName: rec.username || rec.full_name,
+        username: rec.username,
+        // Raw numbers: the Library formats at render time and sorts on these.
+        counts: { like: rec.like_count, comment: rec.comment_count, view: rec.play_count },
+        code: rec.code,
+        pk: rec.pk,
+        mediaType: rec.media_type,
+      });
+      const res = await requireOk({ type: "FBW_SAVED_TOGGLE", entry });
+      // Authoritative, so the bookmark flips without waiting for onChanged
+      // (which still runs and would agree).
+      setSavedIds((s) => {
+        const next = { ...s };
+        if (res.saved) next[id] = true;
+        else delete next[id];
+        return next;
+      });
+    } catch (e) {
+      console.warn("[IgSortTool] falha ao salvar na biblioteca", id, e);
+    }
+  }
+
+  // Item 7: the listed posts as a spreadsheet. One row per post, numbers kept as
+  // numbers so they sort and sum, and the creator stats (item 2) and audio (item 3)
+  // ride along — which is the whole point: the sheet answers "who is worth
+  // modelling", not just "what did this post do".
+  //
+  // The reference extension embeds each thumbnail in the row and bundles ExcelJS
+  // to do it (most of its 970 KB). Here the thumbnail is a URL column and the
+  // writer is ~120 lines over the zip writer this extension already ships.
+  const XLSX_COLS = [
+    { key: "code", label: "Código" },
+    { key: "url", label: "Link" },
+    { key: "username", label: "Perfil" },
+    { key: "user_follower_count", label: "Seguidores" },
+    { key: "views", label: "Visualizações" },
+    { key: "likes", label: "Curtidas" },
+    { key: "comments", label: "Comentários" },
+    { key: "reposts", label: "Reposts" },
+    { key: "er", label: "TE %" },
+    { key: "views_per_follower", label: "Views/seguidor" },
+    { key: "date", label: "Data" },
+    { key: "media_type", label: "Tipo" },
+    { key: "caption", label: "Legenda" },
+    { key: "audio_id", label: "Áudio" },
+    { key: "audio_url", label: "Link do áudio" },
+    { key: "audio_author", label: "Autor do áudio" },
+    { key: "user_biography", label: "Bio" },
+    { key: "user_external_url", label: "Link da bio" },
+    { key: "thumb", label: "Miniatura" },
+    { key: "video", label: "Vídeo" },
+  ];
+  function exportXlsx() {
+    const rows = sorted.map((r) => {
+      const er = engagementRate(r, erW);
+      const vpf =
+        r.play_count != null && r.user_follower_count
+          ? Math.round((r.play_count / r.user_follower_count) * 100) / 100
+          : null;
+      return {
+        code: r.code || null,
+        url: r.code ? `https://www.instagram.com/p/${r.code}/` : null,
+        username: r.username || null,
+        user_follower_count: r.user_follower_count ?? null,
+        views: r.play_count ?? null,
+        likes: r.like_count ?? null,
+        comments: r.comment_count ?? null,
+        reposts: r.repost ?? null,
+        er: er == null ? null : Math.round(er * 100) / 100,
+        views_per_follower: vpf,
+        date: r.taken_at ? new Date(r.taken_at * 1000).toISOString().slice(0, 10) : null,
+        media_type: r.media_type || null,
+        caption: r.caption || null,
+        audio_id: r.audio_id || null,
+        audio_url: r.audio_id ? `https://www.instagram.com/reels/audio/${r.audio_id}/` : null,
+        audio_author: r.audio_author || null,
+        user_biography: r.user_biography || null,
+        user_external_url: r.user_external_url || null,
+        thumb: r.thumb || r.image || null,
+        video: r.video || null,
+      };
+    });
+    const bytes = buildXlsx(XLSX_COLS, rows, "Posts");
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    const stamp = new Date().toISOString().slice(0, 10);
+    chrome.downloads.download({
+      url,
+      // The name follows what the grid actually EXPORTS, which is the picked page —
+      // not the live one. `view` is null under "Tudo", and surfaceFileTag answers
+      // "tudo" for that rather than letting a null reach the file name.
+      filename: downloadPath("sheet", `ig-${surfaceFileTag(view)}-${stamp}.xlsx`),
+      saveAs: false,
+      conflictAction: "uniquify",
+    });
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  // Item 6: ask the page to scroll so Instagram paginates. The pacing lives in the
+  // page (scrollGapMs — 3 s, then 6 s, then 10 s) because that is where the
+  // scrolling happens; the panel only says how many rounds.
+  const [scrolling, setScrolling] = useState(false);
+  async function harvest(rounds) {
+    // send() targets the bound Instagram TAB — the scroll runs in the page, and
+    // the background has no idea what is on screen there.
+    if (scrolling) {
+      await send({ type: "FBW_IG_SCROLL_STOP" }, { userAction: true }).catch(() => {});
+      setScrolling(false);
+      return;
+    }
+    setScrolling(true);
+    const res = await send({ type: "FBW_IG_SCROLL", rounds }, { userAction: true }).catch(() => null);
+    if (!res) {
+      setScrolling(false);
+      return;
+    }
+    // The page paces itself; this is the panel's own estimate of when it is done.
+    const ms = rounds * 3000 + Math.max(0, rounds - 5) * 3000 + Math.max(0, rounds - 10) * 4000;
+    setTimeout(() => setScrolling(false), ms);
+  }
+
+  // Transcribe a reel: hand the background the direct MP4 URL (captured via the
+  // always-on full-stats fetch). It reuses the same Whisper pipeline as Facebook;
+  // the result streams into fbw_transcripts → Library → Transcripts.
+  async function transcribe(rec) {
+    const id = rec.code || rec.pk;
+    if (!rec.video) return;
+    chrome.runtime.sendMessage({
+      type: "FBW_TRANSCRIBE",
+      videoId: id,
+      mediaUrl: rec.video,
+      platform: "instagram",
+      language: await readStoredTranscriptLanguage(),
+      caption: rec.caption || null,
+      author: {
+        name: rec.username || rec.full_name || "desconhecido",
+        url: rec.username ? `/${rec.username}/` : null,
+      },
+      thumb: rec.thumb || rec.image || null,
+      // Raw numbers, like the Library entries — VideoCard formats at render time.
+      counts: {
+        like: rec.like_count ?? null,
+        comment: rec.comment_count ?? null,
+        views: rec.play_count ?? null,
+        share: rec.repost ?? null,
+      },
+      // The same post metadata the page overlay forwards, so a reel transcribed
+      // from this pane gets the same Library card as one transcribed from the
+      // page. It is all already in `rec` — no request is made for it.
+      takenAt: rec.taken_at ?? null,
+      followers: rec.user_follower_count ?? null,
+      durationS: rec.duration ?? null,
+    });
+    setTxMap((m) => ({ ...m, [id]: "running" })); // optimistic; store listener corrects
+  }
+
+  // Green button → read the finished transcript from the shared store and show
+  // it in a small modal with one-tap copy.
+  async function openTranscript(rec) {
+    const id = rec.code || rec.pk;
+    const r = await chrome.storage.local.get("fbw_transcripts");
+    const t = (r.fbw_transcripts || {})[id];
+    if (!t?.text) return;
+    setCopied(false);
+    setTxModal({ id, username: rec.username || rec.full_name || "desconhecido", text: tidyTranscriptText(t.text) });
+  }
+
+  async function copyTranscript() {
+    try {
+      await navigator.clipboard.writeText(txModal.text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // One banner for every link failure, rendered in every branch below so the
+  // explanation (and its fix) can never be hidden by an empty state.
+  const banner = (
+    <ContentLinkBanner
+      link={link}
+      platformName="Instagram"
+      fixing={fixing}
+      onRevive={revive}
+      onOpenTab={openTab}
+    />
+  );
+
+  if (noTab) return banner;
+
+  return (
+    <div className="space-y-3">
+      {banner}
+      <ToolBar>
+        <ToolSelect label="Ordenar por" value={sortKey} onValueChange={setSortKey} options={SORT_OPTS} />
+        <ToolSelect
+          label="Período"
+          value={dateRange}
+          onValueChange={setDateRange}
+          options={DATE_RANGES.map((r) => ({ value: r.value, label: r.label, short: r.short || r.label }))}
+        />
+        <ToolIconButton
+          icon={sortDir === "desc" ? ArrowDown : ArrowUp}
+          label={sortDir === "desc" ? "Maior → menor" : "Menor → maior"}
+          onClick={toggleSortDir}
+        />
+        <ToolIconButton
+          ref={clearBtnRef}
+          icon={clearArmed ? Trash2 : RotateCw}
+          label={clearArmed ? "Confirmar limpeza" : "Atualizar"}
+          hint={
+            clearArmed
+              ? "Toque de novo para confirmar — apaga a captura de Ordenar e de Stories"
+              : "Atualizar — limpa TODA a captura do Instagram (Ordenar e Stories) e recolhe esta superfície"
+          }
+          variant={clearArmed ? "destructive" : "outline"}
+          onClick={onClearTap}
+        />
+        <ToolIconButton
+          icon={scrolling ? Square : ChevronsDown}
+          label={scrolling ? "Parar a coleta" : "Coletar (rolar 10×)"}
+          hint={
+            scrolling
+              ? "Parar a rolagem automática"
+              : "Rola a página em ritmo humano (3 s, depois 6 s, depois 10 s) para o Instagram carregar mais posts"
+          }
+          onClick={() => harvest(10)}
+        />
+        <ToolIconButton
+          icon={Captions}
+          label={txBulk ? "Enfileirando…" : "Transcrever todos"}
+          hint="Transcreve, um de cada vez, os vídeos listados que ainda não têm transcrição"
+          onClick={transcribeAll}
+          disabled={txBulk || !bulkTranscribeTargets(sorted, txMap).length}
+        />
+        <ToolIconButton
+          icon={sweep?.running ? Square : MessagesSquare}
+          label={sweep?.running ? `Comentários ${sweep.done}/${sweep.total} — parar` : "Comentários de todos"}
+          hint={
+            sweep?.running
+              ? "Para a leitura dos comentários depois do post atual"
+              : "Abre, um por vez e em aba própria, até 15 posts listados com comentários e lê as respostas (20–40 s entre posts)"
+          }
+          onClick={sweepComments}
+          disabled={!sweep?.running && !commentSweepTargets(sorted).length}
+        />
+        <ToolIconButton
+          icon={Sheet}
+          label="Planilha (.xlsx)"
+          hint="Exporta os posts listados com seguidores, TE, views por seguidor e áudio"
+          onClick={exportXlsx}
+          disabled={!sorted.length}
+        />
+        <ActionButton
+          icon={bulk ? Square : Download}
+          label={bulk ? (bulk.stopping ? "Parando…" : `Parar ${bulk.done}/${bulk.total}`) : "Tudo"}
+          hint={bulk ? "Parar o download de todos os posts" : "Baixar todos os posts listados"}
+          variant="secondary"
+          onClick={bulk ? stopBulk : downloadAll}
+          disabled={bulk ? bulk.stopping : !sorted.length}
+        />
+      </ToolBar>
+
+      <QueryBuilder query={query} setQuery={setQuery} fields={IG_QUERY_FIELDS} primaryKey={sortKey} />
+
+      {/* ER weights (item 5). What counts as engagement differs per niche — a
+          saved-heavy niche wants comments weighted differently from a viral one —
+          and the on-page overlay reads the same stored numbers. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+        <span className="font-medium text-foreground/80">Peso do TE:</span>
+        {[
+          ["like", "curtida"],
+          ["comment", "coment."],
+          ["repost", "repost"],
+        ].map(([k, label]) => (
+          <label key={k} className="flex items-center gap-1">
+            {label}
+            <input
+              type="number"
+              min="0"
+              step="1"
+              value={erW[k]}
+              onChange={(e) => setWeight(k, e.target.value)}
+              className="w-11 rounded-md border border-border bg-background px-1 py-0.5 text-[11px] tabular-nums"
+            />
+          </label>
+        ))}
+      </div>
+
+      {/* What each glyph on the card means — the page rails can't carry tooltips
+          (pointer-events:none), so this is where they are explained. */}
+      <MetricLegend weights={erW} platform="instagram" />
+
+      {/* Was "N coletados · <raw surface key>" plus a "mostrar tudo" toggle. The
+          raw key is what hid the bucket bug: "explore" reads like a real answer. */}
+      <SurfacePicker
+        value={pick}
+        onChange={setPick}
+        live={surface}
+        surfaces={surfaces}
+        total={records.length}
+        shown={sorted.length}
+      />
+
+      <div className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-border bg-card px-3 py-2">
+        <Label htmlFor="ig-overlay" className="min-w-0 text-xs text-foreground cursor-pointer">
+          Sobreposição de estatísticas no Instagram
+        </Label>
+        <Switch id="ig-overlay" className="shrink-0" checked={overlay} onCheckedChange={toggleOverlay} />
+      </div>
+
+
+      {!sorted.length ? (
+        <p className="text-sm text-muted-foreground py-8 text-center">
+          Role o feed do Instagram para coletar posts e ordená-los aqui.
+        </p>
+      ) : (
+        <div className={"grid grid-cols-2 gap-2 " + stagger}>
+          {sorted.map((rec) => {
+            const c = recordToCard(rec);
+            const st = statusOf(statusKey(c.id));
+            const stThumb = statusOf(statusKey(c.id, "thumb"));
+            const er = engagementRate(rec, erW);
+            const TypeIcon = TYPE_ICON[c.type] || ImageIcon;
+            return (
+              <div
+                key={c.id}
+                className="group relative aspect-[9/16] overflow-hidden rounded-xl bg-muted ring-1 ring-black/5"
+              >
+                {c.thumb ? (
+                  c.permalink ? (
+                    <a href={c.permalink} target="_blank" rel="noreferrer" className="absolute inset-0">
+                      <img src={c.thumb} alt="" loading="lazy" className="h-full w-full object-cover" />
+                    </a>
+                  ) : (
+                    <img src={c.thumb} alt="" loading="lazy" className="absolute inset-0 h-full w-full object-cover" />
+                  )
+                ) : null}
+
+                {/* actions — top-left */}
+                <div className="absolute left-1.5 top-1.5 flex flex-col gap-1">
+                  <IconBtn
+                    title={savedIds[c.id] ? "Salvo — toque para remover" : "Salvar na biblioteca"}
+                    onClick={() => saveToLibrary(rec)}
+                  >
+                    <Bookmark
+                      className={
+                        "size-3.5 " + (savedIds[c.id] ? "fill-amber text-amber" : "")
+                      }
+                    />
+                  </IconBtn>
+                  <IconBtn
+                    title={statusTitle("Baixar mídia", st, errorOf(statusKey(c.id)))}
+                    onClick={() => downloadRecord(rec)}
+                    disabled={st === "downloading"}
+                  >
+                    <Download
+                      className={
+                        "size-3.5 " +
+                        (st === "done" ? "text-good" : st === "error" ? "text-danger" : "")
+                      }
+                    />
+                  </IconBtn>
+                  <IconBtn
+                    title={statusTitle("Baixar miniatura", stThumb, errorOf(statusKey(c.id, "thumb")))}
+                    onClick={() => downloadThumb(rec)}
+                    disabled={stThumb === "downloading"}
+                  >
+                    <ImageDown
+                      className={
+                        "size-3.5 " +
+                        (stThumb === "done"
+                          ? "text-good"
+                          : stThumb === "error"
+                            ? "text-danger"
+                            : "")
+                      }
+                    />
+                  </IconBtn>
+                  {(rec.video || txMap[c.id] === "done") && (
+                    <IconBtn
+                      title={
+                        txMap[c.id] === "done"
+                          ? "Ver transcrição"
+                          : txMap[c.id] === "error"
+                            ? "Falha na transcrição — toque para tentar novamente"
+                            : "Transcrever"
+                      }
+                      onClick={() =>
+                        txMap[c.id] === "done" ? openTranscript(rec) : transcribe(rec)
+                      }
+                      disabled={txMap[c.id] === "running"}
+                    >
+                      {txMap[c.id] === "running" ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <FileText
+                          className={
+                            "size-3.5 " +
+                            (txMap[c.id] === "done"
+                              ? "text-good"
+                              : txMap[c.id] === "error"
+                                ? "text-danger"
+                                : "")
+                          }
+                        />
+                      )}
+                    </IconBtn>
+                  )}
+                </div>
+
+                {/* media type — top-right, opens the post */}
+                <a
+                  href={c.permalink || undefined}
+                  target="_blank"
+                  rel="noreferrer"
+                  title="Abrir no Instagram"
+                  className="sw-hoverable absolute right-1.5 top-1.5 grid place-items-center rounded-md bg-black/65 p-1 text-white hover:bg-black/80"
+                >
+                  <TypeIcon className="size-3.5" />
+                </a>
+
+                {/* stat rail — right side, subtle blue glow */}
+                <div className="absolute bottom-9 right-1.5 flex flex-col items-end gap-0.5 rounded-lg border border-sky/30 bg-black/60 px-2 py-1.5 text-white shadow-[0_0_10px_rgba(56,130,246,0.28)]">
+                  {c.views != null && (
+                    <div className="flex items-center gap-1 text-[14px] font-extrabold leading-none">
+                      <Eye className="size-3.5" />
+                      {fmtCount(c.views)}
+                    </div>
+                  )}
+                  <div
+                    className={
+                      "flex items-center gap-1 leading-none " +
+                      (c.views == null ? "text-[14px] font-extrabold" : "text-[11.5px] font-bold")
+                    }
+                  >
+                    <Heart className={c.views == null ? "size-3.5" : "size-3"} />
+                    {fmtCount(c.likes)}
+                  </div>
+                  <div className="flex items-center gap-1 text-[11.5px] font-bold leading-none">
+                    <MessageCircle className="size-3" />
+                    {fmtCount(c.comments)}
+                  </div>
+                  {c.reposts != null && (
+                    <div className="flex items-center gap-1 text-[11.5px] font-bold leading-none">
+                      <Repeat2 className="size-3" />
+                      {fmtCount(c.reposts)}
+                    </div>
+                  )}
+                  {er != null && (
+                    <div className="flex items-center gap-1 text-[11.5px] font-bold leading-none">
+                      <Zap className="size-3" />
+                      {fmtER(er)}
+                    </div>
+                  )}
+                  {c.date && (
+                    <div className="flex items-center gap-1 text-[10.5px] font-semibold leading-none opacity-90">
+                      <Calendar className="size-3" />
+                      {c.date}
+                    </div>
+                  )}
+                </div>
+
+                {/* @username — bottom-left */}
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-2 pt-6">
+                  <a
+                    href={c.permalink || undefined}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="pointer-events-auto block max-w-[60%] truncate text-[12px] font-semibold text-white"
+                  >
+                    @{c.username}
+                  </a>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* transcript viewer — small modal with one-tap copy */}
+      {txModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          onClick={() => setTxModal(null)}
+        >
+          <div
+            className="flex max-h-[75vh] w-full max-w-sm flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+              <FileText className="size-4 text-good" />
+              <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+                @{txModal.username} · {txModal.id}
+              </span>
+              <button
+                onClick={() => setTxModal(null)}
+                className="grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto whitespace-pre-wrap px-3 py-2.5 text-[12px] leading-relaxed text-foreground">
+              {txModal.text}
+            </div>
+            <div className="border-t border-border p-2.5">
+              <Button className="w-full" variant={copied ? "secondary" : "default"} onClick={copyTranscript}>
+                {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+                {copied ? "Copiado" : "Copiar transcrição"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

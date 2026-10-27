@@ -1,0 +1,1964 @@
+// FB Research — background service worker.
+//  1) open the side panel on toolbar click
+//  2) reflect run state on the action badge (watches chrome.storage)
+//  3) capture fbcdn video/audio track URLs (webRequest) + drive offscreen
+//     Whisper transcription / ffmpeg download for FB feed videos.
+
+import { parseFbcdnTrack, foldTrack, pickByWindow } from "./lib/fbcdn.js";
+import { downloadPath, underDownloadRoot, initDownloadPrefs } from "./lib/downloadPath.js";
+
+// The folder/flat settings are read synchronously by every path builder, so the
+// cache behind them has to be primed the moment this worker wakes — an MV3 worker
+// is torn down at 30s idle and re-created for the next message.
+initDownloadPrefs();
+import { mergeMeta } from "./lib/shared/metaMerge.js";
+import { serialQueue } from "./lib/serialQueue.js";
+import {
+  applyTranscriptLanguageDefaultOnce,
+  captionTrackLanguage,
+  whisperTranscriptLanguage,
+} from "./lib/transcriptionLanguage.js";
+import { resolveTranscriptLanguage } from "./lib/captionLanguage.js";
+import {
+  TX_INTERRUPTED_ERROR,
+  TX_STALL_MS,
+  fmtDeadline,
+  isActiveTxStatus,
+  orphanedTranscriptIds,
+  savedTranscriptPatch,
+  txDeadlineMs,
+} from "./lib/transcriptJobs.js";
+import { idsOverCap, readTranscriptCap } from "./lib/transcriptCap.js";
+import { readStoredTxPenalty, txPenaltyValue } from "./lib/txPenalty.js";
+import { bytesToBase64, isDataThumb, toDurableThumb, toThumbBlob } from "./lib/thumbCache.js";
+import { RECOVER_GAP_MS, recoverableRecords, resolveFreshThumb } from "./lib/thumbRecover.js";
+// No server in this build: the Spy's hub runs in this worker (hub-local/, sql.js + IndexedDB).
+import { SYNC_KEY, isSyncConfigured, getSpyProfiles, syncSettings } from "./hub-local/client.js";
+import { localHub, setCollectStories } from "./hub-local/hub.js";
+
+import {
+  SPY_KEY,
+  SPY_PREFS_KEY,
+  SPY_QUEUE_KEY,
+  SPY_STATE_KEY,
+  emptySpyQueue,
+  emptySpyState,
+  mergeList,
+  queueOp,
+  isBlocked,
+} from "./lib/spyStore.js";
+import { TX_LANG_KEY } from "./lib/shared/txLang.js";
+
+import { createVoiceJobs } from "./lib/voiceJobs.js";
+import { parseProfileUrl, spyId } from "./lib/spyProfile.js";
+import {
+  finishIgDeep,
+  flushSpy,
+  measureFbProfile,
+  mutateSpy,
+  observeIgProfile,
+  pauseInstagram,
+  receiveIgPosts,
+  recoverSpySync,
+  scheduleSpy,
+  serializeIg,
+  spyTick,
+  useSpyDeps,
+  blockPlatform,
+  logSpy,
+} from "./background/spy.js";
+import { createStoriesPass, STORIES_ALARM } from "./background/spyStories.js";
+import { SPY_STATE_KEY as SPY_STATE_KEY_FOR_STORIES, isBlocked as spyIsBlocked } from "./lib/spyStore.js";
+
+import { createAnalysisCollect } from "./background/analysisCollect.js";
+
+
+// Top-video analyses for the Hub: the relay takes the Hub's collection jobs, the
+// collector reads each post in a tab of its own. Instagram is shared with the
+// Spy: its pause stops the collector, a running batch makes it wait, and a wall
+// the collector meets pauses the Spy too.
+const analysisCollect = createAnalysisCollect({
+  chrome,
+  fetchImpl: (...args) => fetch(...args),
+  instagram: {
+    blocked: async () => {
+      const state = (await chrome.storage.local.get(SPY_STATE_KEY))[SPY_STATE_KEY];
+      return isBlocked(state, "instagram") ? state.blockedReason?.instagram || "rate_limited" : null;
+    },
+    busy: async () => !!(await chrome.storage.local.get(SPY_STATE_KEY))[SPY_STATE_KEY]?.igBatch,
+    pause: (code) => pauseInstagram(code),
+    serialize: (work) => serializeIg(work),
+  },
+});
+analysisCollect.recover().catch(() => {});
+chrome.webRequest?.onCompleted?.addListener((details) => analysisCollect.onResponse(details), { urls: ["https://*.instagram.com/*"] });
+chrome.tabs?.onUpdated?.addListener((tabId, change) => {
+  if (change.url) analysisCollect.onNavigation(tabId, change.url);
+});
+
+// The spy area (background/spy.js) shares these two with the archive. Both
+// are function declarations, so they exist before this line runs.
+// The stories pass (tracked profiles' stories for the hub's swipe file): the
+// Spy's storage, log, blocking and Instagram serialization, through `deps`.
+const storiesPass = createStoriesPass({
+  fetchImpl: (...args) => fetch(...args),
+  storage: chrome.storage.local,
+  alarms: chrome.alarms,
+  readSyncSettings,
+  logSpy,
+  blockPlatform,
+  isBlockedNow: async (now) => {
+    const r = await chrome.storage.local.get(SPY_STATE_KEY_FOR_STORIES);
+    return spyIsBlocked(r[SPY_STATE_KEY_FOR_STORIES], "instagram", now);
+  },
+  serialize: serializeIg,
+  flush: () => flushSpy(),
+  makePoster: (url) => storyPoster(url),
+});
+useSpyDeps({ durableThumb, readSyncSettings, storiesTick: () => storiesPass.tick() });
+// The dashboard's "Coletar stories" (the hub sends it over the relay): a stories pass now.
+setCollectStories((msg, reply) => storiesPass.onCommand(msg, reply));
+// The local hub's hourly upkeep (removed profiles, expired stories, old observations).
+// Created only when missing: re-creating it at every wake would push it back forever.
+const HUB_LOCAL_PRUNE_ALARM = "fbw-hub-local-prune";
+chrome.alarms?.get?.(HUB_LOCAL_PRUNE_ALARM)
+  .then((alarm) => alarm || chrome.alarms.create(HUB_LOCAL_PRUNE_ALARM, { periodInMinutes: 60 }))
+  .catch(() => {});
+
+const TRANSCRIPTS_KEY = "fbw_transcripts"; // storage.local map: videoId -> { status, text, chunks, error, updatedAt }
+const NEED_RELOAD_KEY = "fbw_need_reload"; // panel hint: active FB tab has no live content script
+
+// TikTok's video CDN 403s a hotlinked download (no Referer). fetch/downloads can't
+// set Referer (forbidden header), so add it via a declarativeNetRequest session
+// rule scoped to the TikTok video CDN hosts. Idempotent; installed lazily on the
+// first TikTok download and harmless if the CDN doesn't actually require it.
+const TT_REFERER_RULE_ID = 9101;
+let ttRefererReady = false;
+// Same hosts as the DNR rule below. This test was written out three times as an
+// inline regex, and it could drift from the rule's requestDomains list — a URL the
+// regex matched but the rule did not would silently 403.
+const TT_CDN_RE = /(?:^|\.)(?:tiktok|tiktokcdn|tiktokcdn-us|tiktokv|muscdn|ibytedtos)\.com/i;
+function isTiktokCdn(url) {
+  if (!url) return false;
+  try {
+    return TT_CDN_RE.test(new URL(String(url)).hostname);
+  } catch {
+    // Not a parseable URL (a bare name, a blob:) — fall back to a substring test
+    // rather than reporting "not TikTok" and losing the Referer header.
+    return /tiktok|tiktokcdn|tiktokv|muscdn|ibytedtos/i.test(String(url));
+  }
+}
+async function ensureTiktokReferer() {
+  if (ttRefererReady || !chrome.declarativeNetRequest?.updateSessionRules) return;
+  ttRefererReady = true;
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [TT_REFERER_RULE_ID],
+      addRules: [
+        {
+          id: TT_REFERER_RULE_ID,
+          priority: 1,
+          action: {
+            type: "modifyHeaders",
+            requestHeaders: [
+              { header: "referer", operation: "set", value: "https://www.tiktok.com/" },
+              { header: "origin", operation: "set", value: "https://www.tiktok.com" },
+            ],
+          },
+          condition: {
+            requestDomains: ["tiktokcdn.com", "tiktokcdn-us.com", "tiktokv.com", "tiktok.com", "muscdn.com", "ibytedtos.com"],
+            resourceTypes: ["media", "xmlhttprequest", "other", "image"],
+          },
+        },
+      ],
+    });
+  } catch {
+    ttRefererReady = false; // let a later download retry the install
+  }
+}
+
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === "fbw-spy-tick") {
+    spyTick().catch(() => {});
+  } else if (alarm.name === "fbw-spy-sync") {
+    flushSpy().catch(() => {});
+  } else if (alarm.name === STORIES_ALARM) {
+    storiesPass.tick().catch(() => {});
+  } else if (alarm.name === HUB_LOCAL_PRUNE_ALARM) {
+    localHub().then((hub) => hub.prune()).catch(() => {});
+  }
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.sidePanel
+    .setPanelBehavior({ openPanelOnActionClick: true })
+    .catch(() => {});
+  reinjectContentScripts();
+  scheduleSpy().catch(() => {});
+  recoverSpySync().catch(() => {});
+  // Per-run event telemetry (and the JSON it used to download after every run)
+  // was removed; drop the buffer key left behind by pre-0.68 versions so it
+  // doesn't sit in storage forever holding a few thousand stale events.
+  chrome.storage.local.remove("fbw_run_events").catch(() => {});
+  // 0.97.1 moved the transcription default to English; installs that already
+  // stored a pick get it once, here (see lib/transcriptionLanguage.js).
+  applyTranscriptLanguageDefaultOnce().catch(() => {});
+});
+
+// Re-inject content scripts into already-open platform tabs after an extension
+// reload/update — otherwise every open FB/IG/TT tab silently loses its engine
+// ("Receiving end does not exist") until the tab is manually reloaded. All our
+// content scripts carry an init guard, so double-injection is a no-op.
+//
+// `onlyTabId` narrows the sweep to a single tab. The panel's one-click recovery
+// needs exactly this manifest → executeScript mapping, so it reuses this
+// function instead of keeping a second copy that could drift — the `world`
+// mapping especially: a MAIN-world script injected as ISOLATED runs happily and
+// does nothing, which is the hardest possible bug to see.
+async function reinjectContentScripts(onlyTabId = null) {
+  let injected = 0;
+  for (const cs of chrome.runtime.getManifest().content_scripts || []) {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: cs.matches });
+    } catch {
+      continue;
+    }
+    for (const t of tabs) {
+      if (onlyTabId != null && t.id !== onlyTabId) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: t.id },
+          files: cs.js,
+          world: cs.world === "MAIN" ? "MAIN" : "ISOLATED",
+        });
+        injected += 1;
+      } catch {
+        /* discarded/errored tabs — the panel's reload banner covers those */
+      }
+    }
+  }
+  return injected;
+}
+
+// ---- one-click recovery for a tab whose content scripts are gone ----
+// Every content script answers FBW_PING, so a ping is the liveness test — the
+// same test tabs.onActivated already uses to set fbw_need_reload.
+function pingTab(tabId) {
+  return chrome.tabs.sendMessage(tabId, { type: "FBW_PING" }).then(
+    () => true,
+    () => false,
+  );
+}
+async function waitForPing(tabId, attempts, delayMs) {
+  for (let i = 0; i < attempts; i += 1) {
+    if (await pingTab(tabId)) return true;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return false;
+}
+
+// Cheapest repair first. Re-injection keeps the page exactly as the user left
+// it — scroll position, the open reel, a half-typed comment — so it is tried
+// before the blunt fallback. A reload is only needed for tabs executeScript
+// cannot reach: one open since before the extension had its host permission, or
+// one Chrome discarded. A reload re-runs the manifest's content scripts by
+// itself, so afterwards we only wait for one of them to answer.
+//
+// WHY THE LADDER TAKES ITS STEPS AS AN ARGUMENT. Only the `alive` rung is
+// reachable on demand in a real browser: Chrome heals the tab before the
+// fallbacks can run — a discarded tab resurrects on the very first sendMessage,
+// and an extension reload re-injects every content script from onInstalled. Three
+// live attempts to force `inject`/`reload` all came back `alive`. So the rungs
+// below it are covered by unit tests instead (src/background.test.js), which
+// hand in fake steps. `steps` is the ONLY change from the previous shape; the
+// order, the retry counts and every return value are byte-for-byte the same.
+export async function reviveWith(steps, tabId) {
+  if (tabId == null) return { ok: false, error: "nenhuma aba para reconectar" };
+  if (await steps.ping(tabId)) return { ok: true, method: "alive" };
+  try {
+    await steps.reinject(tabId);
+  } catch {
+    /* fall through to the reload path */
+  }
+  if (await steps.waitForPing(tabId, 6, 250)) return { ok: true, method: "inject" };
+  try {
+    await steps.reload(tabId);
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+  // ≤10s covers a cold facebook.com load on a slow connection.
+  if (await steps.waitForPing(tabId, 20, 500)) return { ok: true, method: "reload" };
+  return { ok: false, error: "a aba não respondeu depois de recarregar" };
+}
+
+const REVIVE_STEPS = {
+  ping: (tabId) => pingTab(tabId),
+  reinject: (tabId) => reinjectContentScripts(tabId),
+  waitForPing: (tabId, attempts, delayMs) => waitForPing(tabId, attempts, delayMs),
+  reload: (tabId) => chrome.tabs.reload(tabId),
+};
+
+function reviveTab(tabId) {
+  return reviveWith(REVIVE_STEPS, tabId);
+}
+
+// Recovery succeeded → the stale-tab hint is provably wrong, so retire it. This
+// is what lets the panel re-enable itself without being reopened: the panel and
+// the Library both watch this key through storage.onChanged.
+async function markTabHealthy() {
+  try {
+    await chrome.storage.local.set({ [NEED_RELOAD_KEY]: false });
+  } catch {
+    /* storage unavailable during teardown */
+  }
+}
+chrome.runtime.onStartup?.addListener(() => {
+  chrome.sidePanel
+    .setPanelBehavior({ openPanelOnActionClick: true })
+    .catch(() => {});
+  scheduleSpy().catch(() => {});
+  recoverSpySync().catch(() => {});
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes[SAVED_KEY]) capSavedStore(changes[SAVED_KEY].newValue);
+  if (changes[SPY_PREFS_KEY] || changes[SYNC_KEY] || changes[SPY_KEY]) {
+    scheduleSpy().catch(() => {});
+  }
+  if (changes[SPY_QUEUE_KEY] || changes[SYNC_KEY]) recoverSpySync().catch(() => {});
+});
+
+// `fbw_saved` is the shared Library. It used to be written from TEN places (six
+// panel tools, three page overlays, the transcription rail), each doing its own
+// get → mutate → set, which is a lost-update race: two toggles in flight (panel +
+// page, or two tabs) and one silently overwrites the other. They also wrote five
+// different record shapes.
+//
+// Now every write goes through FBW_SAVED_TOGGLE below, serialized here. The cap
+// stays a single owner too: capping in every writer would have meant ten copies.
+// ---- durable thumbnails ----------------------------------------------------
+// Every record that reaches storage passes through here. The platforms hand out
+// SIGNED thumbnail URLs (`oe=` on fbcdn/cdninstagram, `x-expires=` on tiktokcdn)
+// that die in days, which is why an Arquivo card that looked fine on Monday was a
+// broken-image icon by Friday — the record was intact, the LINK had expired. The
+// bytes are fetched once and stored as a small `data:` URL instead, which is what
+// Facebook's transcription rail always did (it canvases a frame off the <video>).
+//
+// Failure keeps the original URL: it may still render in a page context, and the
+// Arquivo's recovery pass can ask the platform for a fresh one later.
+// A story's poster for the hub: the cover as a 144 px WebP (the hub's grid shows
+// posters only; the media itself plays in the viewer).
+function storyPoster(url) {
+  return toThumbBlob(url, { width: 144 });
+}
+
+async function durableThumb(url) {
+  if (!url || isDataThumb(url)) return url || null;
+  try {
+    if (isTiktokCdn(url)) await ensureTiktokReferer();
+    return await toDurableThumb(url);
+  } catch {
+    return url;
+  }
+}
+
+const SAVED_KEY = "fbw_saved";
+const SAVED_CAP = 300;
+
+function capMap(map) {
+  const keys = Object.keys(map);
+  if (keys.length <= SAVED_CAP) return map;
+  const kept = keys
+    .sort((a, b) => (map[b]?.updatedAt || 0) - (map[a]?.updatedAt || 0))
+    .slice(0, SAVED_CAP);
+  const next = {};
+  for (const k of kept) next[k] = map[k];
+  return next;
+}
+
+// Backstop for anything still writing the key directly (and for records arriving
+// from an older build). Trims oldest-first by updatedAt; the write re-fires this
+// listener but by then we're at the cap, so the guard stops it (no loop).
+function capSavedStore(map) {
+  if (!map || typeof map !== "object") return;
+  if (Object.keys(map).length <= SAVED_CAP) return;
+  chrome.storage.local.set({ [SAVED_KEY]: capMap(map) });
+}
+
+// Serialize the read-modify-write. Every toggle queues behind the previous one, so
+// concurrent saves from different tabs/worlds can't clobber each other.
+const queueSavedWrite = serialQueue();
+
+// Toggle one entry: present → remove, absent → insert. Returns whether the item
+// is saved AFTER the call, so a caller can paint the bookmark from the truth
+// rather than from an optimistic guess.
+function toggleSaved(entry) {
+  return queueSavedWrite(async () => {
+    if (!entry || !entry.videoId) throw new Error("entrada inválida");
+    const id = String(entry.videoId);
+    const r = await chrome.storage.local.get(SAVED_KEY);
+    const map = r[SAVED_KEY] || {};
+    let saved;
+    if (map[id]) {
+      delete map[id];
+      saved = false;
+    } else {
+      // Inside the queue on purpose: un-saving must not pay for a thumbnail
+      // fetch, and only this branch knows the entry is actually being stored.
+      map[id] = { ...entry, thumb: await durableThumb(entry.thumb) };
+      saved = true;
+    }
+    await chrome.storage.local.set({ [SAVED_KEY]: capMap(map) });
+    if (saved) queueForSync("saved", id).catch(() => {});
+    return saved;
+  });
+}
+
+// Insert-or-refresh, never remove — the auto-capture path (favorite a post while
+// warming) must not toggle a record off just because it was already there. Merges
+// by default so an existing record's transcript text/chunks survive a metadata
+// refresh.
+async function upsertSaved(entry, merge = true) {
+  const e = entry && entry.thumb ? { ...entry, thumb: await durableThumb(entry.thumb) } : entry;
+  return queueSavedWrite(async () => {
+    if (!e || !e.videoId) throw new Error("entrada inválida");
+    const id = String(e.videoId);
+    const r = await chrome.storage.local.get(SAVED_KEY);
+    const map = r[SAVED_KEY] || {};
+    map[id] = merge ? { ...map[id], ...e, videoId: id } : e;
+    if (!map[id].updatedAt) map[id].updatedAt = Date.now();
+    await chrome.storage.local.set({ [SAVED_KEY]: capMap(map) });
+    queueForSync("saved", id).catch(() => {});
+    return true;
+  });
+}
+
+// Unconditional remove (the Library's per-item delete and "limpar tudo").
+function removeSaved(ids) {
+  return queueSavedWrite(async () => {
+    const list = (Array.isArray(ids) ? ids : [ids]).filter(Boolean).map(String);
+    const r = await chrome.storage.local.get(SAVED_KEY);
+    const map = r[SAVED_KEY] || {};
+    let removed = 0;
+    for (const id of list)
+      if (map[id]) {
+        delete map[id];
+        removed++;
+      }
+    if (removed) await chrome.storage.local.set({ [SAVED_KEY]: map });
+    return removed;
+  });
+}
+
+// ---- thumbnail recovery ----------------------------------------------------
+// The repair pass for records already in storage with a dead link. Routes and
+// their limits are documented in lib/thumbRecover.js; this is just the driver:
+// one request at a time, a per-platform gap between them, and the result written
+// back as `data:` bytes so the card can never rot again.
+//
+// A recovered thumbnail does NOT bump updatedAt — the Arquivo is ordered by it,
+// and repairing a picture is not the user editing the record. That is why this
+// patches the maps directly instead of going through putTranscript/upsertSaved.
+let thumbSweep = { running: false, done: 0, total: 0, fixed: 0, failed: 0 };
+
+function patchThumbs(key, patches) {
+  const queue = key === TRANSCRIPTS_KEY ? queueTranscriptWrite : queueSavedWrite;
+  return queue(async () => {
+    const r = await chrome.storage.local.get(key);
+    const map = r[key] || {};
+    let n = 0;
+    for (const [id, thumb] of Object.entries(patches)) {
+      if (!map[id] || !thumb) continue;
+      map[id] = { ...map[id], thumb };
+      n += 1;
+    }
+    if (n) {
+      await chrome.storage.local.set({ [key]: map });
+      queueForSync(key === TRANSCRIPTS_KEY ? "transcripts" : "saved", Object.keys(patches)).catch(() => {});
+    }
+    return n;
+  });
+}
+
+function reportThumbSweep() {
+  // No panel open is the normal case for a long sweep — ignore the "receiving
+  // end does not exist" that follows.
+  chrome.runtime.sendMessage({ type: "FBW_THUMB_PROGRESS", ...thumbSweep }).catch(() => {});
+}
+
+async function recoverThumbs({ brokenIds } = {}) {
+  if (thumbSweep.running) return { ok: true, ...thumbSweep };
+  const broken = new Set((brokenIds || []).map(String));
+  const stores = [
+    [TRANSCRIPTS_KEY, await getTranscripts()],
+    [SAVED_KEY, (await chrome.storage.local.get(SAVED_KEY))[SAVED_KEY] || {}],
+  ];
+  const jobs = [];
+  for (const [key, map] of stores)
+    for (const rec of recoverableRecords(Object.values(map), { brokenIds: broken }))
+      jobs.push({ key, rec });
+
+  thumbSweep = { running: jobs.length > 0, done: 0, total: jobs.length, fixed: 0, failed: 0 };
+  if (!jobs.length) return { ok: true, ...thumbSweep };
+
+  (async () => {
+    let batch = {};
+    let batchKey = null;
+    const flush = async () => {
+      if (batchKey && Object.keys(batch).length) await patchThumbs(batchKey, batch);
+      batch = {};
+      batchKey = null;
+    };
+    for (const { key, rec } of jobs) {
+      try {
+        const fresh = await resolveFreshThumb(rec);
+        const data = fresh ? await durableThumb(fresh) : null;
+        // durableThumb hands the URL back when the bytes could not be fetched;
+        // storing that would just be the same dead link under a new signature.
+        if (data && isDataThumb(data)) {
+          if (batchKey && batchKey !== key) await flush();
+          batchKey = key;
+          batch[String(rec.videoId)] = data;
+          thumbSweep.fixed += 1;
+        } else {
+          thumbSweep.failed += 1; // deleted, private, or not embeddable
+        }
+      } catch {
+        thumbSweep.failed += 1;
+      }
+      thumbSweep.done += 1;
+      if (Object.keys(batch).length >= 4) await flush();
+      reportThumbSweep();
+      // An MV3 worker dies after 30s with no extension API call, and fetch is not
+      // one. This is the keep-alive; the sweep is also resumable (a record whose
+      // link is still dead comes back in the next pass), so a death mid-run costs
+      // at most the batch that had not been flushed.
+      await chrome.runtime.getPlatformInfo().catch(() => {});
+      await new Promise((r) => setTimeout(r, RECOVER_GAP_MS[rec.platform] ?? 1000));
+    }
+    await flush();
+    thumbSweep.running = false;
+    reportThumbSweep();
+  })();
+
+  return { ok: true, ...thumbSweep };
+}
+
+async function readSyncSettings() {
+  const r = await chrome.storage.local.get(SYNC_KEY);
+  return syncSettings(r[SYNC_KEY]);
+}
+
+// No hub in this build: the write paths still call this, and it does nothing.
+async function queueForSync() {}
+
+// ============================================================================
+// VIDEO TRACK CAPTURE + TRANSCRIPTION / DOWNLOAD
+// ============================================================================
+//
+// FB parses the feed AND fetches video segments off the main thread (worker),
+// so a content script can't see media URLs. The background SW can: chrome.webRequest
+// observes every tab request including worker-issued ones. We capture *.fbcdn.net
+// .mp4 DASH track URLs, key them by video_id, and the currently-playing video is
+// simply the one whose tracks were requested most recently (max lastSeen).
+
+/** key -> { videoId, xpvId, durationS, audioUrl, videoUrl, videoBitrate, lastSeen }
+ *  key = video_id when FB stamps one, else "xpv:<xpv_asset_id>" until aliased. */
+const trackRegistry = new Map();
+// xpv_asset_id -> video_id, learned from any track that carries BOTH ids. Lets us
+// fold an orphaned (video_id:null) audio track into its real video record.
+const xpvToVideoId = new Map();
+const XPV_CAP = 600;
+
+// The FB tab + video the panel is currently previewing (its in-view video).
+
+function registryKeyFor(track) {
+  if (track.videoId) return track.videoId;
+  if (track.xpvId && xpvToVideoId.has(track.xpvId))
+    return xpvToVideoId.get(track.xpvId);
+  if (track.xpvId) return "xpv:" + track.xpvId;
+  return null;
+}
+
+chrome.webRequest?.onBeforeRequest.addListener(
+  (details) => {
+    const track = parseFbcdnTrack(details.url);
+    if (!track) return;
+    // Learn the xpv->video_id alias and migrate any parked orphan audio record
+    // into the real video_id record so a later resolve finds the full a/v pair.
+    if (track.videoId && track.xpvId && !xpvToVideoId.has(track.xpvId)) {
+      xpvToVideoId.set(track.xpvId, track.videoId);
+      const orphan = trackRegistry.get("xpv:" + track.xpvId);
+      if (orphan) {
+        const dest = trackRegistry.get(track.videoId) || {
+          videoId: track.videoId,
+          xpvId: track.xpvId,
+          durationS: orphan.durationS || 0,
+          audioUrl: null,
+          videoUrl: null,
+          videoBitrate: 0,
+          lastSeen: 0,
+        };
+        dest.audioUrl = dest.audioUrl || orphan.audioUrl;
+        if (!dest.videoUrl && orphan.videoUrl) {
+          dest.videoUrl = orphan.videoUrl;
+          dest.videoBitrate = orphan.videoBitrate;
+        }
+        dest.lastSeen = Math.max(dest.lastSeen, orphan.lastSeen);
+        trackRegistry.set(track.videoId, dest);
+        trackRegistry.delete("xpv:" + track.xpvId);
+      }
+    }
+    const key = registryKeyFor(track);
+    if (!key) return;
+    trackRegistry.set(key, foldTrack(trackRegistry.get(key), track, Date.now()));
+    if (trackRegistry.size > TRACK_REGISTRY_CAP) pruneTrackRegistry();
+    // The alias map can grow several times faster than the registry it's pruned
+    // with (many xpv ids alias one video id), so cap it directly too.
+    if (xpvToVideoId.size > XPV_CAP)
+      for (const k of xpvToVideoId.keys()) {
+        xpvToVideoId.delete(k);
+        if (xpvToVideoId.size <= XPV_CAP) break;
+      }
+  },
+  // Without `types` this fires for every image/avatar/sticker on Facebook —
+  // thousands of dispatches a minute that only ever fail the .mp4 regex, and each
+  // one keeps the MV3 service worker awake. Media/XHR only: same tracks, ~95%
+  // fewer events.
+  { urls: ["*://*.fbcdn.net/*"], types: ["media", "xmlhttprequest", "other"] },
+);
+
+// The registry only needs the handful of recently-played videos (a job resolves
+// the most-recent match). Without a cap it grew for the whole warm session —
+// every scrolled reel adds an entry. Prune the oldest by lastSeen back to CAP,
+// and drop any now-dangling xpv→videoId aliases.
+const TRACK_REGISTRY_CAP = 300;
+function pruneTrackRegistry() {
+  const keep = Array.from(trackRegistry.entries())
+    .sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0))
+    .slice(0, TRACK_REGISTRY_CAP);
+  trackRegistry.clear();
+  const liveVideoIds = new Set();
+  for (const [k, v] of keep) {
+    trackRegistry.set(k, v);
+    if (v.videoId) liveVideoIds.add(v.videoId);
+  }
+  for (const [xpv, vid] of xpvToVideoId)
+    if (!liveVideoIds.has(vid)) xpvToVideoId.delete(xpv);
+}
+
+/** Most recently active (playing) video that has at least an audio track. */
+function activeVideoId() {
+  let best = null;
+  for (const rec of trackRegistry.values()) {
+    if (rec.audioUrl && (!best || rec.lastSeen > best.lastSeen)) best = rec;
+  }
+  return best ? best.videoId : null;
+}
+
+function resolveTracks(videoId, candidates, durationHint, primedAt) {
+  // 1) Explicit id → ONLY that video's tracks. The content script only fills
+  //    videoId when it's CONFIDENT (permalink/URL or a prior duration match) —
+  //    a junk markup id here once collided with a real neighbour's id and
+  //    transcribed the wrong video.
+  if (videoId && trackRegistry.get(videoId)) return trackRegistry.get(videoId);
+  // 2) Feed jobs (no trustworthy id anywhere in the post markup — proven
+  //    live): prime-window attribution decides — the tracks fetched while the
+  //    content script played THIS video. efg duration_s alone is NOT safe
+  //    (FB stamps preview-cut durations on full videos); it only breaks ties.
+  if (durationHint || primedAt)
+    return pickByWindow(trackRegistry.values(), primedAt || 0, durationHint, 2);
+  // 3) Candidate ids scraped from the post (FB buries the real video_id in the
+  //    markup but not in a clean permalink). Intersect them with what we actually
+  //    captured → deterministic match, no crossing to a prefetched neighbour.
+  //    Prefer a record with both audio+video, then the most recently fetched.
+  if (Array.isArray(candidates) && candidates.length) {
+    let best = null;
+    for (const id of candidates) {
+      const rec = trackRegistry.get(String(id));
+      if (!rec || !rec.audioUrl) continue;
+      if (!best) {
+        best = rec;
+        continue;
+      }
+      const recComplete = !!(rec.audioUrl && rec.videoUrl);
+      const bestComplete = !!(best.audioUrl && best.videoUrl);
+      if (recComplete !== bestComplete) {
+        if (recComplete) best = rec;
+      } else if (rec.lastSeen > best.lastSeen) best = rec;
+    }
+    if (best) return best;
+  }
+  // 4) Explicit id was given but not captured yet → don't cross to another video.
+  if (videoId) return null;
+  // 5) No id at all (e.g. FB reels) → best-effort most-recently-active video.
+  const id = activeVideoId();
+  return id ? trackRegistry.get(id) : null;
+}
+
+// ---- transcript store (storage.local) ----
+async function getTranscripts() {
+  const r = await chrome.storage.local.get(TRANSCRIPTS_KEY);
+  return r[TRANSCRIPTS_KEY] || {};
+}
+// The cap is a SETTING now (Opções → Arquivo), not a constant — see
+// lib/transcriptCap.js for why it exists at all and what "unlimited" costs.
+// Every transcript write queues behind the previous one. The store is one MAP
+// with four writers — the job runner, the metadata backfill, the page's instant
+// "running" card and the Library's delete — each doing get → mutate → set. Two of
+// those in flight and the slower read wins, dropping the other write: a finished
+// transcript overwritten by a running card, a delete resurrecting a record. The
+// saved store was fixed this way first; the queue is shared now (lib/serialQueue).
+const queueTranscriptWrite = serialQueue();
+
+async function putTranscript(videoId, patch, opts = {}) {
+  // Before the queue, not inside it: a thumbnail fetch inside the serial write
+  // would stall every other writer behind the network.
+  const p = patch && patch.thumb ? { ...patch, thumb: await durableThumb(patch.thumb) } : patch;
+  const cap = await readTranscriptCap();
+  return queueTranscriptWrite(async () => {
+    const all = await getTranscripts();
+    // mergeMeta, not a spread: a later write that scraped nothing must not erase
+    // metadata an earlier one captured (a reel filed with `counts: null` beside a
+    // good author and caption is exactly that bug). `error` is state, not scraped
+    // metadata — a running record has to be able to clear a previous failure.
+    // `opts.clear` extends that list for a writer that KNOWS a stored value no
+    // longer describes the record (the caption path and `language`).
+    all[videoId] = {
+      ...mergeMeta(all[videoId] || {}, p, { clear: ["error", ...(opts.clear || [])] }),
+      videoId,
+      updatedAt: Date.now(),
+    };
+    // Rolling history, newest kept. Thumbs make each record 6–20KB and the
+    // Library reads the whole map on every change, which is the cost the user
+    // is choosing when they raise this.
+    for (const id of idsOverCap(all, cap)) delete all[id];
+    await chrome.storage.local.set({ [TRANSCRIPTS_KEY]: all });
+    // The hub gets a copy. Fire-and-forget: a backend that is down or unset must
+    // never make a local write look like it failed.
+    queueForSync("transcripts", videoId).catch(() => {});
+    return all[videoId];
+  });
+}
+
+// The Library's per-item delete and "limpar tudo". Both used to run in the panel
+// as its own get → mutate → set (clear-all as a blind `set({}: {})`), racing every
+// write above — a job finishing mid-clear put its record straight back.
+function removeTranscripts(ids) {
+  return queueTranscriptWrite(async () => {
+    if (ids && ids.all) {
+      await chrome.storage.local.set({ [TRANSCRIPTS_KEY]: {} });
+      return -1;
+    }
+    const list = (Array.isArray(ids) ? ids : [ids]).filter(Boolean).map(String);
+    const all = await getTranscripts();
+    let removed = 0;
+    for (const id of list)
+      if (all[id]) {
+        delete all[id];
+        removed++;
+      }
+    if (removed) await chrome.storage.local.set({ [TRANSCRIPTS_KEY]: all });
+    return removed;
+  });
+}
+// A finished (or failed) job refreshes the Library copy of the same post, if it
+// has one. Starring a transcript copies the record as it is at that moment, so a
+// star pressed mid-job used to leave the Library card "transcrevendo…" forever.
+function refreshSavedTranscript(videoId, record) {
+  if (!videoId || !record) return Promise.resolve(false);
+  return queueSavedWrite(async () => {
+    const id = String(videoId);
+    const r = await chrome.storage.local.get(SAVED_KEY);
+    const map = r[SAVED_KEY] || {};
+    if (!map[id]) return false;
+    map[id] = { ...map[id], ...savedTranscriptPatch(record), updatedAt: Date.now() };
+    await chrome.storage.local.set({ [SAVED_KEY]: map });
+    queueForSync("saved", id).catch(() => {});
+    return true;
+  });
+}
+
+// ---- orphaned jobs ----------------------------------------------------------
+// Jobs live in this worker's memory, so none survives a restart of it: an
+// extension reload, a browser quit, or Chrome retiring the worker mid-job. Any
+// record still "queued"/"running" from BEFORE this boot has nothing behind it —
+// file it as interrupted, in both stores, so the cards stop spinning and the hub
+// gets the truth. Records written after boot are live jobs (the page's instant
+// card can be the very message that woke us) and are left alone.
+const SW_BOOT_AT = Date.now();
+
+function sweepOrphanedTranscripts() {
+  const tx = queueTranscriptWrite(async () => {
+    const all = await getTranscripts();
+    const ids = orphanedTranscriptIds(all, SW_BOOT_AT);
+    if (!ids.length) return all;
+    const now = Date.now();
+    for (const id of ids) all[id] = { ...all[id], status: "error", error: TX_INTERRUPTED_ERROR, updatedAt: now };
+    await chrome.storage.local.set({ [TRANSCRIPTS_KEY]: all });
+    for (const id of ids) queueForSync("transcripts", id).catch(() => {});
+    return all;
+  });
+  // The Library copies: take the transcript's own outcome when there is one,
+  // otherwise the same "interrupted".
+  return tx.then((transcripts) =>
+    queueSavedWrite(async () => {
+      const r = await chrome.storage.local.get(SAVED_KEY);
+      const map = r[SAVED_KEY] || {};
+      const ids = orphanedTranscriptIds(map, SW_BOOT_AT);
+      if (!ids.length) return;
+      const now = Date.now();
+      for (const id of ids) {
+        const t = transcripts[id];
+        map[id] =
+          t && !isActiveTxStatus(t.status)
+            ? { ...map[id], ...savedTranscriptPatch(t), updatedAt: now }
+            : { ...map[id], status: "error", error: TX_INTERRUPTED_ERROR, updatedAt: now };
+      }
+      await chrome.storage.local.set({ [SAVED_KEY]: map });
+      for (const id of ids) queueForSync("saved", id).catch(() => {});
+    }),
+  );
+}
+// Top level, so it is queued ahead of whatever message woke the worker.
+sweepOrphanedTranscripts().catch((e) => console.warn("[fbw] varredura de transcrições órfãs:", e));
+
+export { putTranscript, removeTranscripts, sweepOrphanedTranscripts }; // test seam — see background.transcripts.test.js
+
+// ---- offscreen document lifecycle ----
+let offscreenReady = false;
+let offscreenCreating = null;
+const OFFSCREEN_PATH = "src/offscreen/offscreen.html";
+
+async function ensureOffscreen() {
+  if (offscreenReady) return;
+  if (offscreenCreating) return offscreenCreating;
+  offscreenCreating = (async () => {
+    const has = await chrome.offscreen.hasDocument?.();
+    if (!has) {
+      await chrome.offscreen.createDocument({
+        url: OFFSCREEN_PATH,
+        reasons: ["DOM_SCRAPING"],
+        justification:
+          "Local Whisper transcription and ffmpeg muxing of FB videos.",
+      });
+    }
+    offscreenReady = true;
+  })();
+  try {
+    await offscreenCreating;
+  } catch (e) {
+    // Only ONE failure means "it's already there": the single-document error, which
+    // we race against ourselves. Anything else is a real failure, and swallowing it
+    // as ready left offscreenReady=true on a broken state — every later
+    // callOffscreen then failed with "no receiver" until the worker restarted.
+    const msg = String(e?.message || e);
+    const single = /single offscreen document|only one offscreen/i.test(msg);
+    let exists = single;
+    if (!exists) {
+      // Belt and braces: ask, in case the message wording changes.
+      try {
+        exists = !!(await chrome.offscreen.hasDocument?.());
+      } catch {
+        exists = false;
+      }
+    }
+    offscreenReady = exists;
+    offscreenCreating = null;
+    if (!exists) throw new Error("não foi possível abrir o documento offscreen: " + msg);
+  } finally {
+    offscreenCreating = null;
+  }
+}
+
+/** Send a request to the offscreen document and await its response. */
+function callOffscreen(message) {
+  return chrome.runtime.sendMessage({ ...message, target: "offscreen" });
+}
+
+export function offscreenTranscribeMessage(videoId, audioUrl, language, repetitionPenalty = 1) {
+  return {
+    action: "transcribeFromAudioUrl",
+    videoId,
+    audioUrl,
+    language: whisperTranscriptLanguage(language),
+    repetitionPenalty,
+  };
+}
+
+// ---- job runners ----
+// Parse a WebVTT caption file → { text, chunks:[{timestamp:[start,end], text}] }.
+// Mirrors the Whisper chunk shape so the Library's SRT/txt export just works.
+function vttTime(t) {
+  const m = String(t).trim().match(/(?:(\d+):)?(\d+):(\d+)[.,](\d+)/);
+  if (!m) return 0;
+  const [, h, mm, ss, ms] = m;
+  return (+(h || 0)) * 3600 + +mm * 60 + +ss + +("0." + ms);
+}
+function parseWebVtt(raw) {
+  const body = String(raw).replace(/^﻿/, "").replace(/\r/g, "");
+  const chunks = [];
+  for (const block of body.split(/\n\n+/)) {
+    const lines = block.split("\n").filter(Boolean);
+    const tl = lines.findIndex((l) => l.includes("-->"));
+    if (tl < 0) continue;
+    const [a, b] = lines[tl].split("-->");
+    const text = lines
+      .slice(tl + 1)
+      .join(" ")
+      .replace(/<[^>]+>/g, "") // inline karaoke/style tags
+      .replace(/\{[^}]+\}/g, "")
+      .trim();
+    if (text) chunks.push({ timestamp: [vttTime(a), vttTime(b)], text });
+  }
+  return { text: chunks.map((c) => c.text).join(" ").replace(/\s+/g, " ").trim(), chunks };
+}
+
+/**
+ * The scraped-metadata half of a transcript record, as a patch.
+ *
+ * Both write sites below (caption-first and Whisper) file the same fields, and
+ * they were two hand-kept copies of one list — adding a field meant remembering
+ * to add it twice, and a record written down the caption path would silently lack
+ * whatever the other path had learned to store.
+ *
+ * Every value is omitted when absent rather than written as null, because
+ * `mergeMeta` reads a null as "I didn't see it" and would leave the previous
+ * value in place anyway; omitting says the same thing with less noise.
+ */
+function transcriptMetaPatch(meta = {}) {
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const {
+    thumb, counts, author, caption, platform, sourceUrl,
+    // The link SHAPE the post used. Without it a Library card cannot tell a
+    // correct /watch/?v= (a real video post) from a legacy reel record — see
+    // fbCardLink in src/lib/shared/fbPermalink.js.
+    videoKind,
+  } = meta;
+  // The post's own metadata, all of it already in the caller's hand: Instagram
+  // reads taken_at / video_duration / follower_count off the payloads it already
+  // parses, and Facebook's durationHint is the honest duration the content script
+  // measured on the DOM video. None of this costs a request.
+  const takenAt = num(meta.takenAt);
+  const followers = num(meta.followers);
+  const durationS = num(meta.durationS) ?? num(meta.durationHint);
+  return {
+    ...(thumb ? { thumb } : {}),
+    ...(counts ? { counts } : {}),
+    ...(author ? { author } : {}),
+    ...(caption ? { caption } : {}),
+    ...(platform ? { platform } : {}),
+    ...(sourceUrl ? { sourceUrl } : {}),
+    ...(videoKind ? { videoKind } : {}),
+    ...(takenAt ? { takenAt } : {}),
+    ...(followers ? { followers } : {}),
+    ...(durationS && durationS > 0 ? { durationS } : {}),
+  };
+}
+
+// ---- Whisper jobs, one at a time ------------------------------------------
+// Whisper runs in ONE worker. Concurrent jobs used to all go straight to it:
+// they interleaved (each slower, so more timeouts), shared the offscreen's single
+// "current job" id (one card's progress bar drove another's), and one job timing
+// out sent `abortTranscription`, which terminates the worker — killing every
+// other job with it. Now they queue here, the record says "queued" while waiting,
+// and each job's deadline starts when it actually gets the worker.
+const queueWhisper = serialQueue();
+const whisperJobs = new Set(); // videoIds queued or running — a double click is one job
+// videoId → "it's alive" callback for the running job's stall watchdog, fed by
+// the offscreen's FBW_TX_PROGRESS stream (see the message handler).
+const txHeartbeats = new Map();
+
+function whisperWithWatchdog(id, message, durationS) {
+  const deadline = txDeadlineMs(durationS);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stall = null;
+    const finish = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hard);
+      clearTimeout(stall);
+      if (txHeartbeats.get(id) === beat) txHeartbeats.delete(id);
+      fn(v);
+    };
+    const hard = setTimeout(
+      () => finish(reject, new Error(`transcrição expirou (${fmtDeadline(deadline)}) — tente de novo`)),
+      deadline,
+    );
+    const beat = () => {
+      clearTimeout(stall);
+      stall = setTimeout(
+        () => finish(reject, new Error(`transcrição travou (sem progresso por ${fmtDeadline(TX_STALL_MS)}) — tente de novo`)),
+        TX_STALL_MS,
+      );
+    };
+    beat();
+    txHeartbeats.set(id, beat);
+    callOffscreen(message).then((r) => finish(resolve, r), (e) => finish(reject, e));
+  });
+}
+
+async function runTranscription(videoId, tabId, meta = {}) {
+  // Caption-first: if the platform already ships an ASR/subtitle track (TikTok
+  // `subtitleInfos`), download and parse it instead of running Whisper — far
+  // faster/cheaper. Whisper stays the fallback when no caption URL is present.
+  //
+  // `language` is written with the RESULT, never with "running": a re-run of a
+  // finished transcript keeps its old text on screen until the new one lands, and
+  // stamping the new language at the start labelled that old text wrongly — for
+  // good, when the re-run then failed.
+  if (meta.captionUrl) {
+    const id = videoId;
+    // NOT the user's BR/EN pick: Whisper never runs on this path, so the text is
+    // whatever language TikTok wrote its own subtitle track in. null when the track
+    // is neither of ours — and cleared rather than inherited, so an earlier Whisper
+    // run's language can't end up labelling someone else's caption file.
+    const captionLang = captionTrackLanguage(meta.captionLang);
+    await putTranscript(id, {
+      status: "running", error: null,
+      ...transcriptMetaPatch(meta),
+    });
+    try {
+      if (isTiktokCdn(meta.captionUrl)) await ensureTiktokReferer();
+      const r = await fetch(meta.captionUrl);
+      if (!r.ok) throw new Error("caption fetch failed " + r.status);
+      const { text, chunks } = parseWebVtt(await r.text());
+      if (!text) throw new Error("empty caption");
+      // repetitionPenalty cleared like language: Whisper never ran on this text.
+      const saved = await putTranscript(
+        id,
+        {
+          status: "done", source: "caption", language: captionLang,
+          languageAuto: null, repetitionPenalty: null, text, chunks,
+        },
+        { clear: ["language", "languageAuto", "repetitionPenalty"] },
+      );
+      refreshSavedTranscript(id, saved).catch(() => {});
+      notifyTab(tabId, { type: "FBW_TRANSCRIBE_RESULT", videoId: id, success: true, text: saved.text, chunks: saved.chunks });
+      return;
+    } catch (e) {
+      // Fall through to Whisper if any audio source could still be resolved.
+      // `durationHint`/`primedAt` count: that is the normal Facebook feed shape
+      // (candidates are deliberately stripped for feed jobs — neighbour-id
+      // poison) and resolveTracks below can still match it against the captured
+      // wire tracks. Only give up when there is genuinely nothing to try.
+      const canFallBack =
+        meta.mediaUrl || meta.candidates || meta.durationHint || meta.primedAt;
+      if (!canFallBack) {
+        const failed = await putTranscript(id, { status: "error", error: e.message });
+        refreshSavedTranscript(id, failed).catch(() => {});
+        notifyTab(tabId, { type: "FBW_TRANSCRIBE_RESULT", videoId: id, success: false, error: e.message });
+        return;
+      }
+    }
+  }
+  // Audio source, cheapest first:
+  //   1. a captured DASH audio-only track (small, fast to fetch+decode), then
+  //   2. meta.mediaUrl — a progressive MP4 (Instagram always; Facebook when we
+  //      read progressive_url off the page for a video we never saw on the wire).
+  //      It carries video too, so decoding its audio is heavier — used only as a
+  //      fallback so cached videos still transcribe.
+  let audioUrl = null;
+  let id = videoId;
+  const tracks = resolveTracks(videoId, meta.candidates, meta.durationHint, meta.primedAt);
+  if (tracks && tracks.audioUrl) {
+    audioUrl = tracks.audioUrl;
+    id = tracks.videoId;
+  } else if (meta.mediaUrl) {
+    audioUrl = meta.mediaUrl;
+  }
+  // TikTok audio comes off the same Referer-gated CDN as its video — install the
+  // header rule so the offscreen fetch of the audio doesn't 403.
+  if (meta.platform === "tiktok" || isTiktokCdn(audioUrl)) await ensureTiktokReferer();
+  if (!audioUrl) {
+    notifyTab(tabId, {
+      type: "FBW_TRANSCRIBE_RESULT",
+      videoId,
+      success: false,
+      error: "No audio captured yet — let the video play once, then retry.",
+    });
+    return;
+  }
+  if (!id) {
+    notifyTab(tabId, {
+      type: "FBW_TRANSCRIBE_RESULT",
+      videoId,
+      success: false,
+      error: "Couldn't identify the video.",
+    });
+    return;
+  }
+  // Already queued or running: the second click is the same job. Its button is
+  // released by the first job's result, which carries the same videoId.
+  if (whisperJobs.has(id)) return;
+  whisperJobs.add(id);
+  // The pick, with "auto" resolved from the post's caption (lib/captionLanguage).
+  const { language, auto: languageAuto } = resolveTranscriptLanguage(meta.language, meta.caption);
+  const waiting = whisperJobs.size > 1;
+  await putTranscript(id, {
+    status: waiting ? "queued" : "running",
+    error: null,
+    ...transcriptMetaPatch(meta),
+  });
+  try {
+    await queueWhisper(async () => {
+      if (waiting) await putTranscript(id, { status: "running" });
+      // Read when the job starts, and filed on the record with the text it
+      // produced: the point of storing it is tracing a bad transcript back to the
+      // setting in force.
+      const repetitionPenalty = txPenaltyValue(await readStoredTxPenalty());
+      try {
+        await ensureOffscreen();
+        // Losing the watchdog used to leave Whisper running: the zombie job kept a
+        // core busy, its late reply was dropped, and `inFlight` stayed above zero so
+        // the offscreen document could not idle-release. The abort terminates and
+        // respawns its worker — and with one job at a time it can only ever take
+        // THIS job with it.
+        const res = await whisperWithWatchdog(
+          id,
+          offscreenTranscribeMessage(id, audioUrl, language, repetitionPenalty),
+          meta.durationS ?? meta.durationHint,
+        ).catch(async (e) => {
+          await callOffscreen({ action: "abortTranscription" }).catch(() => {});
+          throw e;
+        });
+        if (!res?.success) throw new Error(res?.error || "Transcription failed");
+        // `text` cleared, not merged: a run that heard no speech must say so,
+        // not leave a previous run's text standing under the new language.
+        const saved = await putTranscript(
+          id,
+          {
+            status: "done",
+            language,
+            languageAuto,
+            repetitionPenalty,
+            text: res.text || "",
+            chunks: res.chunks || [],
+          },
+          { clear: ["text"] },
+        );
+        refreshSavedTranscript(id, saved).catch(() => {});
+        notifyTab(tabId, {
+          type: "FBW_TRANSCRIBE_RESULT",
+          videoId: id,
+          success: true,
+          text: saved.text,
+          chunks: saved.chunks,
+        });
+      } catch (e) {
+        const failed = await putTranscript(id, { status: "error", error: e.message });
+        refreshSavedTranscript(id, failed).catch(() => {});
+        notifyTab(tabId, {
+          type: "FBW_TRANSCRIBE_RESULT",
+          videoId: id,
+          success: false,
+          error: e.message,
+        });
+      }
+    });
+  } finally {
+    whisperJobs.delete(id);
+  }
+}
+
+
+// ---- where downloads land -------------------------------------------------
+// The service worker is the only context that actually calls chrome.downloads for
+// media/JSON, so it — not the sender — decides the folder. Two shapes arrive:
+//
+//   • Panels and pin-api.js CAN import lib/downloadPath.js, so they send a FINISHED
+//     path, already rooted at social-mate/.
+//   • The Facebook / Instagram / TikTok content scripts are import-free on purpose
+//     (an ES import makes CRXJS emit a dynamic-import loader, which those origins'
+//     CSP can kill — that would break all capture). They send a BARE file name plus
+//     `kind`, and `folder` when the bucket isn't just the media kind.
+//
+// The two are told apart by the ROOT SEGMENT, not by which fields are set: a panel
+// sends `kind: "video"` alongside its finished path, so keying off `kind` would run
+// an already-rooted path back through downloadPath and produce
+// "social-mate/videos/social-mate/videos/tt-x.mp4".
+//
+// Either way it is impossible for a caller to land a file in the Downloads root.
+function resolveDownloadPath(msg, fallbackName) {
+  const name = msg.filename || fallbackName;
+  // The two shapes are told apart by whether the name carries a SEPARATOR, not by
+  // the root segment. It used to compare against the literal "social-mate", which
+  // stopped working the moment the folder became a setting (a path under a custom
+  // folder looked "bare" and got the folder applied a second time). A content
+  // script's bare name never contains a slash; a finished path always does —
+  // except under `{folder:"", flat:true}`, where the two shapes are identical and
+  // both functions are idempotent anyway.
+  const finished = /[\\/]/.test(String(name == null ? "" : name));
+  if (finished) return underDownloadRoot(name); // idempotent for a finished path
+  return downloadPath(msg.folder || msg.kind || null, name);
+}
+
+async function runDownload(videoId, tabId, mediaUrl, candidates, mediaName, durationHint, primedAt) {
+  // A direct progressive MP4 (Instagram, or a Facebook reel/video whose
+  // progressive_url we read from the page JSON) → download it as-is, no mux.
+  if (mediaUrl) {
+    try {
+      await chrome.downloads.download({
+        url: mediaUrl,
+        // mediaName arrives already rooted — the FBW_DOWNLOAD handler ran it through
+        // downloadPath before calling us. underDownloadRoot is the belt-and-braces
+        // guard so this stays safe if a future caller passes a raw name. The no-name
+        // fallback is the Instagram case: the IG bridge is the only sender that omits
+        // a name, and it always hands us a progressive MP4.
+        filename: underDownloadRoot(
+          mediaName || downloadPath("video", `ig-${videoId || Date.now()}.mp4`),
+        ),
+      });
+      notifyTab(tabId, { type: "FBW_DOWNLOAD_RESULT", videoId, success: true });
+    } catch (e) {
+      notifyTab(tabId, {
+        type: "FBW_DOWNLOAD_RESULT",
+        videoId,
+        success: false,
+        error: e.message,
+      });
+    }
+    return;
+  }
+  // Facebook = DASH split → mux the captured tracks in the offscreen ffmpeg.
+  const tracks = resolveTracks(videoId, candidates, durationHint, primedAt);
+  if (!tracks || !tracks.videoUrl) {
+    notifyTab(tabId, {
+      type: "FBW_DOWNLOAD_RESULT",
+      videoId,
+      success: false,
+      error: "No video captured yet — let it play once, then retry.",
+    });
+    return;
+  }
+  const id = tracks.videoId;
+  try {
+    await ensureOffscreen();
+    const res = await callOffscreen({
+      action: "muxDownload",
+      videoId: id,
+      videoUrl: tracks.videoUrl,
+      audioUrl: tracks.audioUrl,
+    });
+    if (!res?.success) throw new Error(res?.error || "Download failed");
+    // offscreen minted a blob: URL (valid while the offscreen doc is alive) — no
+    // base64 round-trip. Hand it straight to chrome.downloads.
+    await chrome.downloads.download({
+      url: res.blobUrl,
+      // The offscreen doc returns a BARE name — it muxes bytes, it doesn't decide
+      // where files live. A DASH mux is always a Facebook video, so the folder is
+      // known here.
+      filename: downloadPath("video", res.filename || `fb-${id}.mp4`),
+    });
+    notifyTab(tabId, {
+      type: "FBW_DOWNLOAD_RESULT",
+      videoId: id,
+      success: true,
+    });
+  } catch (e) {
+    notifyTab(tabId, {
+      type: "FBW_DOWNLOAD_RESULT",
+      videoId: id,
+      success: false,
+      error: e.message,
+    });
+  }
+}
+
+function notifyTab(tabId, msg) {
+  if (tabId != null) chrome.tabs.sendMessage(tabId, msg).catch(() => {});
+}
+
+// Tab awareness: when the user switches to a Facebook tab, ping it. If its content
+// script answers, it re-publishes its in-view video (no hint). If it doesn't (tab
+// loaded before the extension, or not yet injected), flag the panel to reload it.
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return;
+  }
+  if (!/^https?:\/\/[^/]*\.(facebook|instagram)\.com\//.test(tab.url || ""))
+    return; // FB/IG tabs
+  chrome.tabs
+    .sendMessage(tabId, { type: "FBW_PING" })
+    .then(() => chrome.storage.local.set({ [NEED_RELOAD_KEY]: false }))
+    .catch(() => chrome.storage.local.set({ [NEED_RELOAD_KEY]: true }));
+});
+
+// ---- JSON exports ----
+// Service workers have no URL.createObjectURL, so JSON files go out as a data:
+// URL. It must be built through TextEncoder — btoa() alone throws on the emoji in
+// comment text, which would silently lose exactly the exports worth reading.
+// Bytes -> base64 lives in lib/thumbCache.js now — the thumbnail cache needs the
+// same encoder, and this was already the second copy.
+
+function jsonDataUrl(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj, null, 2));
+  return "data:application/json;base64," + bytesToBase64(bytes);
+}
+
+// ---- image downloads ------------------------------------------------------
+// Images used to go out as a base64 data: URL too, which for a photo means the
+// bytes, the binary string and the base64 string resident at once — ~3x the file,
+// every time. The offscreen document HAS URL.createObjectURL, so it fetches and
+// hands back a blob: URL (see fetchToBlobUrl there) and only the bytes exist.
+//
+// TikTok used to be excluded here on the suspicion that the declarativeNetRequest
+// Referer rule might not reach a fetch issued by our own offscreen document. It
+// does: a fetch from an extension page returns the real 200 + video/mp4 where
+// chrome.downloads.download() on the same URL returns 403 + text/html. That is
+// the ONLY route that works for TikTok media, so it is no longer an exclusion —
+// it is the reason this function exists.
+
+// downloadId -> blob: URL to release once the item stops being in_progress.
+// chrome.downloads.download resolves when the item is CREATED, so revoking then
+// would be racing the bytes; and leaving it to the offscreen idle release means a
+// 100-photo save holds all 100 blobs at once.
+const blobUrlByDownloadId = new Map();
+
+chrome.downloads.onChanged.addListener((delta) => {
+  if (!delta.state || delta.state.current === "in_progress") return;
+  const blobUrl = blobUrlByDownloadId.get(delta.id);
+  if (!blobUrl) return;
+  blobUrlByDownloadId.delete(delta.id);
+  callOffscreen({ action: "revokeBlobUrl", blobUrl }).catch(() => {});
+});
+
+// chrome.downloads.download() RESOLVES WHEN THE ITEM IS CREATED, not when the
+// bytes land — so a server that answers 403 reports success to the caller and
+// leaves an error page on disk under the name we asked for. That is exactly how
+// TikTok videos were arriving as .html: 403, `text/html`, 502 bytes, and a green
+// tick in the panel.
+//
+// So: wait for the item to leave `in_progress` and surface the real failure.
+// The cap exists because this must not outlive a genuinely long download — a
+// rejected request fails within a second or two, so anything still running at
+// the cap is a download that is working, and we let it finish unwatched.
+const DOWNLOAD_VERIFY_MS = 30000;
+function waitForDownload(id) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn, arg) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      fn(arg);
+    };
+    const onChanged = (delta) => {
+      if (delta.id !== id || !delta.state || delta.state.current === "in_progress") return;
+      if (delta.state.current === "complete") return finish(resolve);
+      // `delta.error` is only present when the error itself changed in this
+      // event, so read the item for the reason rather than trusting the delta.
+      chrome.downloads
+        .search({ id })
+        .then((items) => finish(reject, new Error((items[0] && items[0].error) || "download interrompido")))
+        .catch(() => finish(reject, new Error("download interrompido")));
+    };
+    const timer = setTimeout(() => finish(resolve), DOWNLOAD_VERIFY_MS);
+    chrome.downloads.onChanged.addListener(onChanged);
+  });
+}
+
+// The worker-side route: fetch the bytes here (the DNR Referer rule DOES apply to
+// a fetch from the service worker) and hand chrome.downloads a data: URL, which
+// it reads out of the string instead of going back to the network. Costs a base64
+// copy of the file, which is why it is the fallback and not the first choice.
+async function downloadFetchedBytes(msg, filename, defaultType) {
+  let res = await fetch(msg.url).catch(() => null);
+  if ((!res || !res.ok) && msg.fallbackUrl) res = await fetch(msg.fallbackUrl).catch(() => null);
+  if (!res || !res.ok) throw new Error("fetch failed " + (res ? res.status : "network"));
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const type = res.headers.get("content-type") || defaultType;
+  const id = await chrome.downloads.download({ url: `data:${type};base64,${bytesToBase64(buf)}`, filename });
+  await waitForDownload(id);
+}
+
+/** Returns false when the offscreen route produced no download — the caller then
+ *  falls back to the data: URL path rather than losing the file. */
+async function downloadViaOffscreen(msg, filename) {
+  try {
+    await ensureOffscreen();
+    const res = await callOffscreen({
+      action: "fetchToBlobUrl",
+      url: msg.url,
+      fallbackUrl: msg.fallbackUrl,
+    });
+    if (!res?.success || !res.blobUrl) return false;
+    const id = await chrome.downloads.download({ url: res.blobUrl, filename });
+    blobUrlByDownloadId.set(id, res.blobUrl);
+    return true;
+  } catch {
+    // Whatever failed (no offscreen document, a dead CDN link, a bad filename) the
+    // fallback re-runs it here and reports the real error. The blob, if one was
+    // minted, is covered by the offscreen document's own revocation timers.
+    return false;
+  }
+}
+
+
+// Voice extraction is a download job; it never writes to the transcript library.
+const voiceJobs = createVoiceJobs({
+  ensureOffscreen,
+  callOffscreen,
+  notifyTab,
+  download: (options) => chrome.downloads.download(options),
+  trackDownload: (id, url) => {
+    blobUrlByDownloadId.set(id, url);
+    // A tiny MP3 can finish before the onChanged listener sees its mapping.
+    chrome.downloads.search({ id }).then((items) => {
+      if (items[0]?.state !== "in_progress" && blobUrlByDownloadId.get(id) === url) {
+        blobUrlByDownloadId.delete(id);
+        callOffscreen({ action: "revokeBlobUrl", blobUrl: url }).catch(() => {});
+      }
+    }).catch(() => {});
+  },
+  release: (blobUrl) => callOffscreen({ action: "revokeBlobUrl", blobUrl }),
+});
+
+// ---- message router (content + panel) ----
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // ignore messages addressed to the offscreen document
+  if (msg?.target === "offscreen") return false;
+
+  switch (msg?.type) {
+    // offscreen → bg: no jobs in flight, runtimes terminated. Close the document so
+    // the WASM heaps (Whisper ~180 MB + MiniLM + ffmpeg) are actually returned to the
+    // OS; WASM memory only shrinks by being discarded. Next job re-creates it.
+    case "FBW_OFFSCREEN_IDLE": {
+      // REFUSE while a download is still reading a blob: URL the offscreen document
+      // owns. The idle timer arms as soon as fetchToBlobUrl RETURNS, which is before
+      // chrome.downloads has finished writing — and closing the document revokes the
+      // blob out from under an in-flight write. Reachable with "ask where to save
+      // each file" on: leave the dialog open past the 45s idle window and the file
+      // fails with an ok:true already sent. The offscreen re-arms its own timer, so
+      // declining here just defers the release.
+      if (blobUrlByDownloadId.size > 0) return false;
+      (async () => {
+        try {
+          if (await chrome.offscreen.hasDocument?.()) await chrome.offscreen.closeDocument();
+        } catch {
+          /* already gone */
+        }
+        offscreenReady = false;
+      })();
+      return false;
+    }
+    // panel → bg: bring ONE tab's content scripts back (re-inject, else reload)
+    // and report what happened. The panel keeps its buttons enabled and shows
+    // this result either way — the whole point is that a failed recovery is as
+    // visible as a successful one.
+    case "FBW_REVIVE_TAB": {
+      (async () => {
+        const res = await reviveTab(msg.tabId);
+        if (res.ok) await markTabHealthy();
+        sendResponse(res);
+      })();
+      return true; // async
+    }
+    case "FBW_RELOAD_TAB": {
+      // The Library's stale-tab hint. Now routed through the same recovery as
+      // the panel banner, so it re-injects (page state preserved) before
+      // resorting to a reload — and clears the hint once the tab answers, which
+      // a bare reload never did. Returning true keeps the worker alive for the
+      // wait; the caller ignores the response.
+      (async () => {
+        const [t] = await chrome.tabs
+          .query({ active: true, lastFocusedWindow: true })
+          .catch(() => []);
+        if (!t || !/(facebook|instagram)\.com/.test(t.url || "")) {
+          sendResponse({ ok: false, error: "nenhuma aba compatível ativa" });
+          return;
+        }
+        const res = await reviveTab(t.id);
+        if (res.ok) await markTabHealthy();
+        sendResponse(res);
+      })();
+      return true; // async
+    }
+    // The page's instant Library card, written the moment Transcribe is clicked.
+    // It used to be a get → mutate → set from the content script, i.e. a fourth
+    // racer on the transcript map; now it queues with every other write.
+    case "FBW_TRANSCRIPT_PUT": {
+      (async () => {
+        const all = await getTranscripts();
+        const prev = all[msg.videoId];
+        if (!msg.videoId || (prev && prev.status === "done")) return; // never clobber a finished one
+        // `language` is dropped: it is the PICK (maybe "auto"), and a record's
+        // language is written with its result — stamped here it relabelled the
+        // text of an earlier run that is still on the card.
+        const { language: _pick, ...record } = msg.record || {};
+        await putTranscript(msg.videoId, { ...record, status: record.status || "running" });
+      })();
+      return false;
+    }
+    // Library delete / "limpar tudo" (the panel used to write the map itself).
+    case "FBW_TRANSCRIPT_REMOVE": {
+      (async () => {
+        const n = await removeTranscripts(msg.all ? { all: true } : msg.ids);
+        sendResponse({ removed: n });
+      })();
+      return true; // async
+    }
+    // Late metadata from the page (counts hydrate after the job was requested).
+    // Patches an EXISTING record only — a patch must never mint a record under an
+    // id the transcription pipeline decided not to use — and fills gaps only.
+    case "FBW_META_PATCH": {
+      (async () => {
+        const all = await getTranscripts();
+        const prev = all[msg.videoId];
+        if (!prev || prev.counts) return; // already has them — a patch never overwrites
+        await putTranscript(msg.videoId, { counts: msg.counts || null });
+      })();
+      return false;
+    }
+    case "FBW_EXTRACT_VOICE": {
+      voiceJobs.start(msg, sender.tab?.id).then(sendResponse, (e) => sendResponse({ ok: false, error: e.message }));
+      return true;
+    }
+    case "FBW_CANCEL_VOICE": {
+      voiceJobs.cancel(msg.jobId, sender.tab?.id).then(sendResponse, (e) => sendResponse({ ok: false, error: e.message }));
+      return true;
+    }
+    case "FBW_GET_VOICE_STATUS": {
+      sendResponse({ job: voiceJobs.status(sender.tab?.id) });
+      return false;
+    }
+    // The offscreen's Whisper progress stream. The panel draws it; here every
+    // message is proof of life for the running job's stall watchdog.
+    case "FBW_TX_PROGRESS": {
+      if (sender.url === chrome.runtime.getURL(OFFSCREEN_PATH)) txHeartbeats.get(msg.videoId)?.();
+      return false;
+    }
+    case "FBW_VOICE_PROGRESS": {
+      if (sender.url === chrome.runtime.getURL(OFFSCREEN_PATH)) voiceJobs.progress(msg);
+      return false;
+    }
+    case "FBW_VOICE_COMPLETE": {
+      if (sender.url === chrome.runtime.getURL(OFFSCREEN_PATH))
+        voiceJobs.complete(msg).catch((e) => console.error("[fbw] voice download:", e));
+      return false;
+    }
+    case "FBW_TRANSCRIBE": {
+      runTranscription(msg.videoId, sender.tab?.id, {
+        thumb: msg.thumb,
+        counts: msg.counts,
+        author: msg.author,
+        caption: msg.caption,
+        platform: msg.platform,
+        sourceUrl: msg.sourceUrl,
+        videoKind: msg.videoKind,
+        // Post metadata the caller already had — see transcriptMetaPatch.
+        takenAt: msg.takenAt,
+        followers: msg.followers,
+        durationS: msg.durationS,
+        language: msg.language,
+        mediaUrl: msg.mediaUrl,
+        captionUrl: msg.captionUrl, // caption-first (TikTok subtitleInfos webvtt)
+        captionFormat: msg.captionFormat,
+        captionLang: msg.captionLang, // the TRACK's own language, not the user's pick
+        // Feed post markup embeds NEIGHBOURING videos' ids — candidates from a
+        // feed job are poison, refuse them even if a buggy/stale content
+        // script sends some.
+        candidates: msg.feedSurface ? null : msg.candidates,
+        durationHint: msg.durationHint,
+        primedAt: msg.primedAt,
+      });
+      sendResponse({ started: true });
+      return false;
+    }
+    case "FBW_DOWNLOAD": {
+      runDownload(
+        msg.videoId,
+        sender.tab?.id,
+        msg.mediaUrl,
+        msg.feedSurface ? null : msg.candidates,
+        // The FB rail sends a bare "fb-<id>.mp4"; the IG bridge sends no name at all
+        // (its progressive MP4 is always Instagram). The folder is decided here, not
+        // by the content script — neither of them can import downloadPath.
+        msg.mediaName ? downloadPath("video", msg.mediaName) : null,
+        msg.durationHint,
+        msg.primedAt,
+      );
+      sendResponse({ started: true });
+      return false;
+    }
+    // content → bg: "which captured video is this DOM <video>?" — duration-keyed
+    // lookup so a feed post with no permalink id still gets a deterministic
+    // record id (and can then find its media in the page's embedded JSON).
+    case "FBW_MATCH_TRACKS": {
+      const rec = pickByWindow(trackRegistry.values(), msg.primedAt || 0, msg.durationHint, 2);
+      sendResponse({ videoId: rec ? rec.videoId : null });
+      return false;
+    }
+    // panel/content → bg: the ONLY writer of fbw_saved. Serialized here so two
+    // toggles in flight (panel + page overlay, or two tabs) can't lose an update.
+    // Replies { ok, saved } — `saved` is the state AFTER the toggle, so the caller
+    // paints the bookmark from the truth instead of guessing.
+    case "FBW_SAVED_TOGGLE": {
+      toggleSaved(msg.entry)
+        .then((saved) => sendResponse({ ok: true, saved }))
+        .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+      return true;
+    }
+    // Insert-or-refresh (auto-capture "favoritar"). Never removes, unlike TOGGLE.
+    case "FBW_SAVED_UPSERT": {
+      upsertSaved(msg.entry, msg.merge !== false)
+        .then(() => sendResponse({ ok: true, saved: true }))
+        .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+      return true;
+    }
+    // panel → bg: repair the records whose signed thumbnail URL has expired.
+    // `brokenIds` is what the panel watched fail in an <img>, which catches the
+    // links that died without an expiry stamp.
+    case "FBW_THUMB_RECOVER": {
+      recoverThumbs({ brokenIds: msg.brokenIds })
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+      return true;
+    }
+    // A panel opened mid-sweep has missed the progress messages so far.
+    case "FBW_THUMB_STATUS": {
+      sendResponse({ ok: true, ...thumbSweep });
+      return false;
+    }
+    // Comentários de todos (Ordenar): one post after another, in a tab of our own.
+    case "FBW_IG_COMMENT_SWEEP": {
+      const codes = Array.isArray(msg.codes) ? msg.codes : [];
+      analysisCollect.sweepComments(codes).catch(() => {});
+      sendResponse({ ok: true, status: analysisCollect.sweepStatus() });
+      return false;
+    }
+    case "FBW_IG_COMMENT_SWEEP_STATUS": {
+      sendResponse({ ok: true, status: analysisCollect.sweepStatus() });
+      return false;
+    }
+    case "FBW_IG_COMMENT_SWEEP_STOP": {
+      sendResponse({ ok: analysisCollect.stopSweep(), status: analysisCollect.sweepStatus() });
+      return false;
+    }
+    case "FBW_SPY_OBSERVE": {
+      serializeIg(() => observeIgProfile(msg, sender)).then(sendResponse, () => sendResponse({ ok: false, error: "network" }));
+      return true;
+    }
+    case "FBW_SPY_IG_DEEP_DONE": {
+      finishIgDeep(msg, sender).then(sendResponse, () => sendResponse({ ok: false, error: "storage" }));
+      return true;
+    }
+    case "FBW_SPY_POSTS": {
+      receiveIgPosts(msg, sender).then(sendResponse, () => sendResponse({ ok: false, error: "storage" }));
+      return true;
+    }
+    // panel → bg: Spy area operations
+    case "FBW_SPY_SAVE": {
+      (async () => {
+        try {
+          let platform = msg.platform;
+          let key = msg.key;
+          if (msg.url) {
+            const parsed = parseProfileUrl(msg.url);
+            if (!parsed) {
+              sendResponse({ ok: false, error: "invalid_profile" });
+              return;
+            }
+            platform = parsed.platform;
+            key = parsed.key;
+          }
+          if (!platform || !key) {
+            sendResponse({ ok: false, error: "invalid_profile" });
+            return;
+          }
+
+          const id = spyId(platform, key);
+          const now = Date.now();
+
+          await mutateSpy(async () => {
+            const r = await chrome.storage.local.get([SPY_QUEUE_KEY, SPY_KEY, SPY_STATE_KEY]);
+            const queue = r[SPY_QUEUE_KEY] || emptySpyQueue();
+            const spy = r[SPY_KEY] || { profiles: {} };
+            const state = r[SPY_STATE_KEY] || emptySpyState(now);
+
+            const nextQueue = queueOp(queue, "save", { platform, key, id }, now);
+
+            // Re-added or newly added: MUST start from 0 with no cached measurements!
+            const prev = spy.profiles?.[id] || {};
+            const nextSpy = {
+              ...spy,
+              profiles: {
+                ...(spy.profiles || {}),
+                [id]: {
+                  id,
+                  platform,
+                  key: String(key).toLowerCase(),
+                  name: prev.name || null,
+                  userId: prev.userId || null,
+                  savedAt: now,
+                  listUpdatedAt: now,
+                  removedAt: null,
+                  lastMeasuredAt: null,
+                  hasAvatar: false,
+                },
+              },
+            };
+
+            const nextAttempts = { ...(state.attempts || {}) };
+            delete nextAttempts[id];
+            const nextState = {
+              ...state,
+              attempts: nextAttempts,
+            };
+
+            await chrome.storage.local.set({
+              [SPY_QUEUE_KEY]: nextQueue,
+              [SPY_KEY]: nextSpy,
+              [SPY_STATE_KEY]: nextState,
+            });
+
+          });
+
+          const upload = await flushSpy();
+          scheduleSpy().catch(() => {});
+
+          sendResponse(upload.rejected?.includes(id) ? { ok: false, error: upload.error } : { ok: true, id });
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      })();
+      return true;
+    }
+    case "FBW_SPY_REMOVE": {
+      (async () => {
+        try {
+          const id = msg.id;
+          if (!id) {
+            sendResponse({ ok: false, error: "missing_id" });
+            return;
+          }
+
+          const now = Date.now();
+          await mutateSpy(async () => {
+            const r = await chrome.storage.local.get([SPY_QUEUE_KEY, SPY_KEY, SPY_STATE_KEY]);
+            const queue = r[SPY_QUEUE_KEY] || emptySpyQueue();
+            const spy = r[SPY_KEY] || { profiles: {} };
+            const state = r[SPY_STATE_KEY] || emptySpyState(now);
+
+            const split = id.indexOf(":");
+            const platform = id.slice(0, split);
+            const key = id.slice(split + 1);
+            let nextQueue = queueOp(queue, "remove", { id, platform, key }, now);
+
+            // Clean pending snapshots, errors and profile patches for this id
+            if (nextQueue.snapshots) {
+              const cleanedSnaps = { ...nextQueue.snapshots };
+              for (const k of Object.keys(cleanedSnaps)) {
+                if (k.startsWith(`${id}|`)) delete cleanedSnaps[k];
+              }
+              nextQueue = { ...nextQueue, snapshots: cleanedSnaps };
+            }
+            if (nextQueue.errors?.[id]) {
+              const cleanedErrors = { ...nextQueue.errors };
+              delete cleanedErrors[id];
+              nextQueue = { ...nextQueue, errors: cleanedErrors };
+            }
+            if (nextQueue.profiles?.[id]) {
+              const cleanedProfiles = { ...nextQueue.profiles };
+              delete cleanedProfiles[id];
+              nextQueue = { ...nextQueue, profiles: cleanedProfiles };
+            }
+
+            const nextProfiles = { ...(spy.profiles || {}) };
+            delete nextProfiles[id];
+            const nextSpy = {
+              ...spy,
+              profiles: nextProfiles,
+            };
+
+            const nextAttempts = { ...(state.attempts || {}) };
+            delete nextAttempts[id];
+            const nextState = {
+              ...state,
+              attempts: nextAttempts,
+              measuring: state.measuring?.id === id ? null : state.measuring,
+            };
+
+            await chrome.storage.local.set({
+              [SPY_QUEUE_KEY]: nextQueue,
+              [SPY_KEY]: nextSpy,
+              [SPY_STATE_KEY]: nextState,
+            });
+
+          });
+
+          const upload = await flushSpy();
+          scheduleSpy().catch(() => {});
+
+          sendResponse(upload.rejected?.includes(id) ? { ok: false, error: upload.error } : { ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      })();
+      return true;
+    }
+    case "FBW_SPY_MEASURE_ONE": {
+      (async () => {
+        try {
+          const id = msg.id;
+          if (!id) {
+            sendResponse({ ok: false, error: "missing_id" });
+            return;
+          }
+          const r = await chrome.storage.local.get(SPY_KEY);
+          const spy = r[SPY_KEY] || { profiles: {} };
+          const profile = spy.profiles?.[id];
+          if (!profile || profile.removedAt != null) {
+            sendResponse({ ok: false, error: "not_found" });
+            return;
+          }
+
+          if (profile.platform === "facebook") {
+            const res = await measureFbProfile(profile, "visit", fetch, { force: true });
+            sendResponse(res);
+          } else {
+            sendResponse({ ok: false, code: "passive_only", error: "No Instagram, abra o perfil para medir pela captura passiva." });
+          }
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      })();
+      return true;
+    }
+    case "FBW_SPY_REFRESH_LIST": {
+      (async () => {
+        try {
+          const settings = await readSyncSettings();
+          if (!isSyncConfigured(settings)) {
+            sendResponse({ ok: false, error: "acervo não configurado" });
+            return;
+          }
+          const res = await getSpyProfiles(settings);
+          const nextSpy = await mutateSpy(async () => {
+            const r = await chrome.storage.local.get([SPY_KEY, SPY_QUEUE_KEY]);
+            const currentSpy = r[SPY_KEY] || { profiles: {} };
+            const queue = r[SPY_QUEUE_KEY] || emptySpyQueue();
+            const nextSpy = mergeList(currentSpy, res?.profiles || [], queue.ops || []);
+            await chrome.storage.local.set({ [SPY_KEY]: nextSpy });
+            return nextSpy;
+          });
+
+          scheduleSpy().catch(() => {});
+          sendResponse({ ok: true, count: Object.keys(nextSpy.profiles || {}).length });
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      })();
+      return true;
+    }
+    // dashboard → bg: one request to the local hub ({ method, path, body } as the hub's HTTP API).
+    // Every write goes through this worker, so the pages never race it.
+    case "FBW_HUB_LOCAL": {
+      localHub()
+        .then((hub) => hub.handle(msg.method || "GET", String(msg.path || ""), msg.body))
+        .then(
+          (res) => sendResponse({ ok: res.status >= 200 && res.status < 300, status: res.status, json: res.json ?? null }),
+          (e) => sendResponse({ ok: false, status: 0, error: String(e?.message || e) }),
+        );
+      return true;
+    }
+    case "FBW_SPY_RUN": {
+      (async () => {
+        try {
+          const res = await spyTick({ manual: true });
+          sendResponse(res);
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      })();
+      return true;
+    }
+    case "FBW_SAVED_REMOVE": {
+      removeSaved(msg.ids ?? msg.id)
+        .then((removed) => sendResponse({ ok: true, removed }))
+        .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+      return true;
+    }
+    // content → bg: an arbitrary JSON payload → file on disk (comment scrapes).
+    // The SW has no URL.createObjectURL, so route through jsonDataUrl
+    // (TextEncoder → base64 data URL, emoji-safe).
+    case "FBW_DL_JSON": {
+      // The download must be AWAITED. Un-awaited, a bad filename or data URL
+      // rejected unobserved and the sender still got {ok:true} — the exact reason a
+      // failed comment export looked like a successful one.
+      (async () => {
+        try {
+          await chrome.downloads.download({
+            url: jsonDataUrl(msg.data),
+            filename: resolveDownloadPath(msg, `export-${Date.now()}.json`),
+            saveAs: false,
+            conflictAction: "uniquify",
+          });
+          sendResponse({ ok: true });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e?.message || e) });
+        }
+      })();
+      return true; // async responder
+    }
+    // panel → bg: download IG media. video = direct URL; image = fetched with our
+    // host permissions (bypasses page CORS) and saved from a blob: URL minted in
+    // the offscreen document, TikTok excepted. Carousels arrive one msg/child.
+    case "FBW_DL_MEDIA": {
+      (async () => {
+        try {
+          // TikTok media (video or thumbnail) needs the Referer header injected.
+          if (isTiktokCdn(msg.url)) await ensureTiktokReferer();
+          const filename = resolveDownloadPath(msg, `media-${Date.now()}`);
+          if (msg.kind === "video") {
+            // A TikTok video CANNOT be fetched by chrome.downloads: that request
+            // is browser-initiated, so our DNR rule never sees it, the CDN
+            // answers 403 with an HTML error body, and Chrome saves that body
+            // under a .html name. An extension-page fetch does carry the header,
+            // so mint a blob there and download the blob instead.
+            //
+            // Everything else keeps the direct download on purpose: it streams to
+            // disk, where the blob route would hold the whole file in memory
+            // first — fine for a 12 MB TikTok clip, not for a long FB video.
+            if (isTiktokCdn(msg.url)) {
+              if (await downloadViaOffscreen(msg, filename)) {
+                sendResponse({ ok: true });
+                return;
+              }
+              // No offscreen document (or it failed): same bytes, via the worker.
+              await downloadFetchedBytes(msg, filename, "video/mp4");
+              sendResponse({ ok: true });
+              return;
+            }
+            const id = await chrome.downloads.download({ url: msg.url, filename });
+            await waitForDownload(id);
+            sendResponse({ ok: true });
+            return;
+          }
+          if (await downloadViaOffscreen(msg, filename)) {
+            sendResponse({ ok: true });
+            return;
+          }
+          await downloadFetchedBytes(msg, filename, "image/jpeg");
+          sendResponse({ ok: true });
+        } catch (e) {
+          sendResponse({ ok: false, error: e.message });
+        }
+      })();
+      return true; // async
+    }
+    default:
+      return false;
+  }
+});
+
+export { scheduleSpy, flushSpy, spyTick, measureFbProfile, advanceReelsJob, fetchWantedThumbs } from "./background/spy.js"; // test seam
+

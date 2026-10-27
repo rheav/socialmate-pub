@@ -1,0 +1,865 @@
+import { useEffect, useRef, useState } from "react";
+import { ChevronDown, Bookmark, BookmarkCheck, Trash2, ExternalLink, ArrowDown, ArrowUp } from "lucide-react";
+import { downloadPath, sanitizeFilenamePart } from "@/lib/downloadPath";
+import { fmtCount } from "@/lib/igMedia";
+import { sendBg } from "@/lib/bg";
+import { chunkIndexAt, centerScrollTop } from "@/lib/playhead.js";
+import { fbCardLink } from "@/lib/shared/fbPermalink.js";
+import { usePlayhead } from "@/lib/usePlayhead.js";
+import { transcriptMetaChips, fmtClock } from "@/lib/transcriptMeta.js";
+import {
+  recordedTranscriptLanguageShort,
+  readStoredTranscriptLanguage,
+  writeStoredTranscriptLanguage,
+  normalizeTranscriptLanguage,
+  TRANSCRIPT_LANGUAGE_KEY,
+} from "@/lib/transcriptionLanguage.js";
+import { TX_LANG_OPTIONS } from "@/lib/shared/txLang.js";
+import { removalFailed } from "@/lib/transcriptStore.js";
+import { advanceTxProgress } from "@/lib/transcriptionProgress.js";
+import { heardNoSpeech, isTranscribing } from "@/lib/transcriptCardState.js";
+import { tidyTranscriptText } from "@/lib/transcriptJobs.js";
+import { SAVED_SORT_OPTS, sortSavedRecords } from "@/lib/savedSort.js";
+import { ToolBar, ToolSelect, ToolIconButton } from "@/components/ui/ToolBar.jsx";
+import { useThumbRecovery } from "@/lib/useThumbRecovery.js";
+import { ImageOff } from "lucide-react";
+
+const TKEY = "fbw_transcripts";
+const SKEY = "fbw_saved";
+const COLLAPSE_KEY = "fbw_saved_collapsed";
+
+const hasStorage = () => typeof chrome !== "undefined" && !!chrome?.storage?.local;
+
+function srt(chunks) {
+  const t = (s) => {
+    const ms = Math.floor((s % 1) * 1000), x = Math.floor(s);
+    const p = (n, l = 2) => String(n).padStart(l, "0");
+    return `${p(Math.floor(x / 3600))}:${p(Math.floor((x % 3600) / 60))}:${p(x % 60)},${p(ms, 3)}`;
+  };
+  return chunks
+    .map((c, i) => `${i + 1}\n${t(c.timestamp?.[0] || 0)} --> ${t(c.timestamp?.[1] || (c.timestamp?.[0] || 0) + 2)}\n${(c.text || "").trim()}\n`)
+    .join("\n");
+}
+// Transcript export. Was a synthetic <a download="…">, which always lands in the
+// Downloads ROOT — Chrome flattens any path in that attribute into the file name
+// (verified). chrome.downloads honours the folder, and the panel is a normal
+// extension page so it can mint the blob URL itself.
+function dl(platform, name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  chrome.downloads.download({
+    url,
+    filename: downloadPath("transcript", name),
+    saveAs: false,
+    conflictAction: "uniquify",
+  });
+  // Free the blob once the download has been handed off.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+// "0:07" — the timestamp on each karaoke line, and what a click on it seeks to.
+// Same prefixes the media downloaders already stamp on their files (ig-, tt-, pin-),
+// so a transcript is recognisable as belonging to its video once both are on disk.
+// `dl()` defaults an unknown platform to facebook, so this map does too.
+const NAME_PREFIX = { facebook: "fb", instagram: "ig", tiktok: "tt", pinterest: "pin" };
+const namePrefix = (platform) => NAME_PREFIX[platform] || "fb";
+
+// "<handle>-ig-<videoId>.txt". The handle leads for the same reason every media
+// file's does (see downloadPath.js): with a flat download folder the name is the
+// only structure, and a transcript belongs next to the video it came from. The
+// record stores the author as a display name, which sanitizeFilenamePart is built
+// to scrub; a transcript filed before that field existed just has no prefix.
+function txName(it, ext) {
+  const who = sanitizeFilenamePart(it.author?.name);
+  const base = `${namePrefix(it.platform)}-${it.videoId}`;
+  return who ? `${who}-${base}.${ext}` : `${base}.${ext}`;
+}
+
+// ---- storage hooks ----
+function useStore(key) {
+  const [items, setItems] = useState([]);
+  useEffect(() => {
+    if (!hasStorage()) return;
+    const load = () =>
+      chrome.storage.local.get(key, (r) => {
+        const map = r[key] || {};
+        setItems(Object.values(map).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
+      });
+    load();
+    const onChange = (changes, area) => { if (area === "local" && changes[key]) load(); };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => chrome.storage.onChanged.removeListener(onChange);
+  }, [key]);
+  return items;
+}
+// Both stores are written by the background only (FBW_SAVED_TOGGLE / _REMOVE for
+// fbw_saved, FBW_TRANSCRIPT_REMOVE for fbw_transcripts), which serializes every
+// write. This pane used to delete straight out of the map with a get→mutate→set,
+// and "limpar tudo" wrote an empty map blind — both raced the running jobs, so a
+// transcript that landed mid-delete came straight back.
+const removeTranscript = (id) => sendBg({ type: "FBW_TRANSCRIPT_REMOVE", ids: [id] });
+const clearTranscripts = () => sendBg({ type: "FBW_TRANSCRIPT_REMOVE", all: true });
+
+// A transcript record doubles as a Library entry when the user stars it. It keeps
+// its own shape (it carries text/chunks); the background merges rather than
+// replaces, so starring never drops the transcript.
+const toggleSavedEntry = (entry) =>
+  sendBg({ type: "FBW_SAVED_TOGGLE", entry: { ...entry, updatedAt: Date.now() } });
+const removeSavedEntry = (ids) => sendBg({ type: "FBW_SAVED_REMOVE", ids });
+
+// Live progress for the jobs currently running, keyed by videoId.
+//
+// These arrive as runtime messages from the offscreen document and are held ONLY
+// here: writing them to storage would rewrite the whole transcript map (thumbnails
+// included, behind a serialized queue) many times per second. A panel that was shut
+// misses the stream and shows the plain "transcrevendo…" it always did.
+function useTxProgress() {
+  const [progress, setProgress] = useState({});
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome?.runtime?.onMessage) return;
+    const onMsg = (msg) => {
+      if (msg?.type !== "FBW_TX_PROGRESS" || !msg.videoId) return;
+      // `start` opens a new job: the bar is forward-only, so without the reset a
+      // re-run of the same video began at the previous run's 100%.
+      setProgress((p) => ({
+        ...p,
+        [msg.videoId]: msg.start ? advanceTxProgress(0, msg.pct) : advanceTxProgress(p[msg.videoId], msg.pct),
+      }));
+    };
+    chrome.runtime.onMessage.addListener(onMsg);
+    return () => chrome.runtime.onMessage.removeListener(onMsg);
+  }, []);
+  return progress;
+}
+
+// Which platform groups in Salvos are folded shut.
+//
+// In storage, not component state: this panel is mounted fresh every time the
+// side panel is opened, so a fold kept in useState came back open on the next
+// visit — which is the one thing a fold is for. Every panel window reads the
+// same key, so folding Facebook in one folds it in all of them.
+//
+// Only the SHUT platforms are written. "Everything open" is therefore the empty
+// object (and the default for a key that was never set), and a platform that
+// stops appearing in the Library leaves nothing behind in storage.
+function useCollapsedGroups() {
+  const [collapsed, setCollapsed] = useState({});
+
+  useEffect(() => {
+    if (!hasStorage()) return;
+    const load = () =>
+      chrome.storage.local.get(COLLAPSE_KEY, (r) => {
+        const v = r[COLLAPSE_KEY];
+        setCollapsed(v && typeof v === "object" && !Array.isArray(v) ? v : {});
+      });
+    load();
+    const onChange = (c, area) => { if (area === "local" && c[COLLAPSE_KEY]) load(); };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => chrome.storage.onChanged.removeListener(onChange);
+  }, []);
+
+  // Optimistic: the group folds now and storage catches up. The write is built
+  // from the current value rather than inside the state updater, which React may
+  // call more than once per change — a persist in there would fire twice.
+  const toggle = (platform) => {
+    const next = { ...collapsed };
+    if (next[platform]) delete next[platform];
+    else next[platform] = true;
+    setCollapsed(next);
+    try {
+      chrome?.storage?.local?.set({ [COLLAPSE_KEY]: next });
+    } catch {
+      /* applied locally; only the persistence is lost */
+    }
+  };
+
+  return [collapsed, toggle];
+}
+
+function useFlag(key) {
+  const [val, setVal] = useState(false);
+  useEffect(() => {
+    if (!hasStorage()) return;
+    const load = () => chrome.storage.local.get(key, (r) => setVal(!!r[key]));
+    load();
+    const onChange = (c, area) => { if (area === "local" && c[key]) setVal(!!c[key].newValue); };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => chrome.storage.onChanged.removeListener(onChange);
+  }, [key]);
+  return val;
+}
+
+// The BR/EN choice, shown where every transcript lands.
+//
+// The page rails (Facebook, Instagram stories, TikTok) each carry this menu on
+// their own Transcribe button, but the PANEL's transcribe buttons — Instagram
+// reels, TikTok sort, TikTok stories — only ever read the stored value, with
+// nothing on screen saying what it was. Same key, same value, so a change here
+// and a change on a rail are the same change.
+function TxLanguageToggle() {
+  const [lang, setLang] = useState(null); // null until the stored value is read
+  useEffect(() => {
+    if (!hasStorage()) return;
+    readStoredTranscriptLanguage().then(setLang).catch(() => {});
+    const onChange = (c, area) => {
+      if (area === "local" && c[TRANSCRIPT_LANGUAGE_KEY])
+        setLang(normalizeTranscriptLanguage(c[TRANSCRIPT_LANGUAGE_KEY].newValue));
+    };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => chrome.storage.onChanged.removeListener(onChange);
+  }, []);
+  if (lang === null) return null;
+  return (
+    <div className="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5" title="Idioma das próximas transcrições">
+      {TX_LANG_OPTIONS.map((o) => (
+        <button
+          key={o.value}
+          onClick={() => writeStoredTranscriptLanguage(o.value).then(setLang)}
+          aria-pressed={lang === o.value}
+          title={o.label}
+          className={
+            lang === o.value
+              ? "rounded-[4px] bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground"
+              : "rounded-[4px] px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground hover:text-foreground"
+          }
+        >
+          {o.short}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ReloadHint() {
+  const needsReload = useFlag("fbw_need_reload");
+  if (!needsReload) return null;
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg bg-amber/10 border border-amber/30 px-2.5 py-2 text-[11px] text-amber">
+      <span className="min-w-0 flex-1 break-words">Esta aba ainda não está vinculada — recarregue-a para capturar o vídeo aqui.</span>
+      <button
+        className="flex-none rounded-md bg-amber px-2 py-1 text-[11px] font-medium text-onaccent hover:bg-amber-soft"
+        onClick={() => hasStorage() && chrome.runtime.sendMessage({ type: "FBW_RELOAD_TAB" })}
+      >
+        Recarregar aba
+      </button>
+    </div>
+  );
+}
+
+// ---- grid tile: a big thumbnail on top, meta + transcript below ----
+// The transcript, line by line with its timestamps. It used to be a wall of text
+// unless the video happened to be playing in the tab; the lines are the useful
+// shape either way. While the tab plays THIS video (`live`), the active line is
+// the one the playhead is inside (lib/playhead.js decides, with a small lead)
+// and clicking a line seeks the page video to it; otherwise the lines are static.
+//
+// The scroll is deliberately NOT scrollIntoView: this list lives in a 176px box
+// inside the scrolling Library, and scrollIntoView walks up every scrollable
+// ancestor — it would yank the whole panel on each line change. Scroll the
+// container itself, and only when the active index actually moves.
+function TranscriptLines({ chunks, t, live, onSeek }) {
+  const boxRef = useRef(null);
+  const rowsRef = useRef([]);
+  const idx = live ? chunkIndexAt(chunks, t) : -1;
+  const lastIdx = useRef(-1);
+
+  useEffect(() => {
+    if (idx < 0 || idx === lastIdx.current) return;
+    lastIdx.current = idx;
+    const box = boxRef.current;
+    const row = rowsRef.current[idx];
+    if (!box || !row) return;
+    // Rects, not offsetTop: the box is not a positioned ancestor, so offsetTop
+    // measured the row's distance down the whole panel and scrolled this list
+    // straight to its bottom on every line.
+    const b = box.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    const top = centerScrollTop({
+      scrollTop: box.scrollTop,
+      boxTop: b.top,
+      boxHeight: box.clientHeight,
+      rowTop: r.top,
+      rowHeight: r.height,
+      scrollHeight: box.scrollHeight,
+    });
+    if (top != null) box.scrollTo({ top, behavior: "smooth" });
+  }, [idx]);
+
+  return (
+    <div
+      ref={boxRef}
+      className="console max-h-44 overflow-y-auto rounded-md p-2 text-[11px] leading-relaxed"
+    >
+      {chunks.map((c, i) =>
+        live ? (
+          <button
+            key={i}
+            ref={(el) => (rowsRef.current[i] = el)}
+            onClick={() => onSeek(c.timestamp?.[0] || 0)}
+            title="Ir para este ponto do vídeo"
+            className={`sw-hoverable block w-full rounded px-1 py-0.5 text-left break-words ${
+              i === idx ? "bg-sky/25 text-[#eceff4]" : "text-[#d9e0ee]/60 hover:text-[#d9e0ee]"
+            }`}
+          >
+            <span className="mr-1.5 tabular-nums text-[10px] text-[#d9e0ee]/45">
+              {fmtClock(c.timestamp?.[0])}
+            </span>
+            {(c.text || "").trim()}
+          </button>
+        ) : (
+          <div key={i} className="px-1 py-0.5 break-words text-[#d9e0ee]/85">
+            <span className="mr-1.5 tabular-nums text-[10px] text-[#d9e0ee]/45">
+              {fmtClock(c.timestamp?.[0])}
+            </span>
+            {(c.text || "").trim()}
+          </div>
+        ),
+      )}
+    </div>
+  );
+}
+
+// `transcribing` says whether this record is a transcription JOB, and it has to
+// come from the caller: the card cannot tell from the record alone. Transcript
+// records and Library records share this component and this shape, and a Library
+// record saved straight off a grid has no `text` for the plain reason that nobody
+// ever asked for one. Deriving "no text ⇒ running" is what made every saved post
+// sit under "transcrevendo…" forever, with no job behind it.
+function VideoCard({ it, saved, onToggleSave, onDelete, deleteError, progress, playhead, transcribing, onThumbError }) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  // Whisper records written before 0.98 carry double spaces (chunks were joined
+  // with a space on top of their own leading one). Tidied here, for the copy and
+  // the .txt too — the stored record is left as it is.
+  const text = tidyTranscriptText(it.text);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard refused (panel not focused) — the label simply doesn't flip */
+    }
+  };
+  // Counts are stored as raw numbers (schema 2) and formatted here. Records
+  // written before that carry pre-formatted strings — pass those through.
+  const n = (v) => (typeof v === "number" ? fmtCount(v) : v || null);
+  const raw = it.counts || {};
+  const c = {
+    like: n(raw.like),
+    comment: n(raw.comment),
+    views: n(raw.views),
+    share: n(raw.share),
+  };
+  const hasCounts = c.like || c.comment || c.share || c.views;
+  // Second strip line: what we know about the POST, under how it performed. Only
+  // what was actually captured — a Facebook record usually contributes a duration
+  // and nothing else, so this is often one chip, or absent entirely.
+  const meta = transcriptMetaChips(it);
+  // Live lines only for THIS card, and only when the tab is playing THIS video.
+  // The id travels with every tick precisely so a reel change can't scrub the
+  // wrong transcript. No chunks (an old record) → the plain text view, unchanged.
+  const karaoke = !!playhead?.tick && playhead.tick.videoId === it.videoId && !!it.chunks?.length;
+  // Auto-open the transcript when its video starts playing — the whole point is
+  // not having to click anything while you watch.
+  useEffect(() => {
+    if (karaoke) setOpen(true);
+  }, [karaoke]);
+  const base = it.platform === "instagram" ? "https://www.instagram.com" : "https://www.facebook.com";
+  // author.url comes in two shapes: FB/IG store a relative path (needs an origin
+  // prepended above), while Pinterest/TikTok already store a full absolute URL —
+  // prepending an origin to those would nest one URL inside another and produce a
+  // dead link. Pass absolute URLs through unchanged.
+  const isAbsolute = /^https?:\/\//.test(it.author?.url || "");
+  const profUrl = it.author?.url ? (isAbsolute ? it.author.url : `${base}${it.author.url.startsWith("/") ? "" : "/"}${it.author.url}`) : null;
+  // Link back to the original reel/video: the stored sourceUrl, or reconstruct
+  // one from the id for older records (FB reels key by their reel id).
+  // Facebook records captured from a feed before 0.75.1 stored /watch/?v=<id>,
+  // and that route falls back to the reels FEED when Facebook won't serve the
+  // item — which is how a card opened a totally different reel. fbCardLink
+  // rebuilds those as /reel/<id>; every other platform keeps its own URL.
+  const srcUrl =
+    it.platform === "instagram"
+      ? it.sourceUrl || (it.videoId ? `https://www.instagram.com/p/${it.videoId}/` : null)
+      : fbCardLink({
+          platform: it.platform,
+          videoId: it.videoId,
+          sourceUrl: it.sourceUrl,
+          // Records captured since this fix say which link shape the post used, so
+          // a real /videos/ post keeps its watch URL instead of being rebuilt as a
+          // reel it is not. Absent on legacy records — those still get rebuilt.
+          videoKind: it.videoKind,
+        });
+  return (
+    <div className="flex flex-col overflow-hidden rounded-xl border border-border bg-card">
+      <div className="relative aspect-[3/4] console">
+        {srcUrl ? (
+          <a href={srcUrl} target="_blank" rel="noreferrer" title="Abrir o reel original" className="block h-full w-full">
+            {it.thumb ? (
+              // onError is not decoration: a signed CDN link that died without an
+              // expiry stamp can only be detected by watching it fail.
+              <img
+                src={it.thumb}
+                alt=""
+                className="h-full w-full object-cover"
+                referrerPolicy="no-referrer"
+                onError={() => onThumbError?.(it.videoId)}
+              />
+            ) : (
+              <div className="grid h-full w-full place-items-center text-[10px] text-[#d9e0ee]/45">abrir reel</div>
+            )}
+          </a>
+        ) : it.thumb ? (
+          <img
+            src={it.thumb}
+            alt=""
+            className="h-full w-full object-cover"
+            referrerPolicy="no-referrer"
+            onError={() => onThumbError?.(it.videoId)}
+          />
+        ) : (
+          <div className="grid h-full w-full place-items-center text-[10px] text-[#d9e0ee]/45">sem prévia</div>
+        )}
+        {/* actions on the thumbnail */}
+        <div className="absolute right-1.5 top-1.5 flex gap-1">
+          {srcUrl && (
+            <a
+              href={srcUrl}
+             
+              target="_blank"
+              rel="noreferrer"
+              title="Abrir o reel original"
+              className="grid size-6 place-items-center rounded-md bg-black/70 text-white hover:bg-black/85"
+            >
+              <ExternalLink size={12} />
+            </a>
+          )}
+          <button
+            onClick={onToggleSave}
+            title={saved ? "Remover dos salvos" : "Salvar"}
+            className="grid size-6 place-items-center rounded-md bg-black/70 text-white hover:bg-black/85"
+          >
+            {saved ? <BookmarkCheck size={13} className="text-amber" /> : <Bookmark size={13} />}
+          </button>
+          {onDelete && (
+            <button
+              onClick={onDelete}
+              title="Excluir esta transcrição"
+              className="grid size-6 place-items-center rounded-md bg-black/70 text-white hover:bg-black/85"
+            >
+              <Trash2 size={12} />
+            </button>
+          )}
+        </div>
+        {/* counts strip. A gradient alone does not carry text over a thumbnail:
+            its top is transparent by definition, so exactly the rows that sit
+            highest — and, since the metadata line landed, that is most of the
+            strip — were reading against whatever the frame happened to be. Bright
+            faces and burnt-in captions won. So: a solid scrim under the text, with
+            a short gradient above it so the panel still fades into the image
+            instead of cutting it with a hard edge. No backdrop blur — the panel
+            scrolls a dozen of these at once and the page overlay already measured
+            what that costs (68 ms → 8 ms per frame after removal). */}
+        {(hasCounts || meta.length > 0) && (
+          <div className="absolute inset-x-0 bottom-0">
+            <div className="h-5 bg-gradient-to-t from-black/75 to-transparent" />
+            <div
+              className="flex flex-col gap-0.5 bg-black/75 px-2 pb-1.5 pt-0.5 text-[10px] font-medium text-white"
+              style={{ textShadow: "0 1px 2px rgba(0,0,0,.55)" }}
+            >
+              {hasCounts && (
+                <div className="flex flex-wrap gap-x-2 gap-y-0.5">
+                  {c.like && <span>👍 {c.like}</span>}
+                  {c.comment && <span>💬 {c.comment}</span>}
+                  {c.views && <span>👁 {c.views}</span>}
+                  {c.share && <span>↗ {c.share}</span>}
+                </div>
+              )}
+              {meta.length > 0 && (
+                <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[9px] font-normal text-white/85">
+                  {meta.map((m) => (
+                    <span key={m.key} title={m.title}>
+                      {m.icon} {m.text}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-1 flex-col gap-1 p-2">
+        {it.author?.name ? (
+          <a
+            href={profUrl || "#"}
+            target="_blank"
+            rel="noreferrer"
+            className="truncate text-[12px] font-semibold text-foreground hover:underline"
+          >
+            {it.author.name}
+          </a>
+        ) : (
+          <span className="text-[12px] text-muted-foreground">desconhecido</span>
+        )}
+
+        {it.caption && (
+          <p className="line-clamp-2 break-words text-[11px] leading-snug text-foreground/70 whitespace-pre-wrap">
+            {it.caption}
+          </p>
+        )}
+
+        {it.status === "error" && <p className="break-words text-[11px] text-destructive">{it.error}</p>}
+        {deleteError && <p className="break-words text-[11px] text-destructive">{deleteError}</p>}
+
+        {transcribing && (
+          // Real progress when the offscreen document is reporting it (model bytes,
+          // audio bytes, then one 30 s Whisper window at a time); the plain label
+          // when it isn't — a job started before this panel opened, or a caption
+          // transcript, which never runs Whisper at all. Shown ABOVE any text: a
+          // re-run keeps the previous transcript on screen until the new one lands.
+          <div className="mt-0.5">
+            <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+              <span>{it.status === "queued" ? "na fila…" : it.text ? "transcrevendo de novo…" : "transcrevendo…"}</span>
+              {progress != null && it.status !== "queued" && <span className="tabular-nums">{progress}%</span>}
+            </div>
+            {progress != null && it.status !== "queued" && (
+              <div
+                className="mt-1 h-1 w-full overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-valuenow={progress}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <div className="h-full rounded-full bg-primary transition-[width] duration-300" style={{ width: `${progress}%` }} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {it.text ? (
+          <>
+            <button
+              onClick={() => setOpen((o) => !o)}
+              className="mt-0.5 flex items-center gap-1 text-left text-[11px] font-medium text-foreground/80 hover:text-foreground"
+            >
+              <ChevronDown size={12} className={`transition-transform duration-[180ms] ease-[var(--sw-ease)] ${open ? "" : "-rotate-90"}`} />
+              Transcrição
+              {/* Only when the job recorded one. Records made before 0.72 have no
+                  language and were decoded as English — labelling those "BR" is why
+                  an English transcript looked like it had come out in Portuguese. */}
+              {recordedTranscriptLanguageShort(it.language) && (
+                <span
+                  className="rounded-[4px] border border-border px-1 py-0.5 text-[9px] font-semibold text-muted-foreground"
+                  title={it.languageAuto ? "Idioma escolhido pelo modo Automático, a partir da legenda do post" : undefined}
+                >
+                  {recordedTranscriptLanguageShort(it.language)}
+                  {it.languageAuto ? " · auto" : ""}
+                </span>
+              )}
+            </button>
+            {open &&
+              (it.chunks?.length ? (
+                <TranscriptLines
+                  chunks={it.chunks}
+                  live={karaoke}
+                  t={karaoke ? playhead.tick.t : undefined}
+                  onSeek={(t) => playhead.seek(it.videoId, t)}
+                />
+              ) : (
+                <div className="max-h-44 overflow-y-auto rounded-md console p-2 text-[11px] leading-relaxed  break-words whitespace-pre-wrap">
+                  {text}
+                </div>
+              ))}
+            <div className="mt-auto flex flex-wrap gap-x-2 gap-y-0.5 pt-1 text-[11px]">
+              <button className="text-primary hover:underline" onClick={copy}>
+                {copied ? "copiado ✓" : "copiar"}
+              </button>
+              <button className="text-primary hover:underline" onClick={() => dl(it.platform, txName(it, "txt"), text)}>.txt</button>
+              {it.chunks?.length ? (
+                <button className="text-primary hover:underline" onClick={() => dl(it.platform, txName(it, "srt"), srt(it.chunks))}>.srt</button>
+              ) : null}
+            </div>
+          </>
+        ) : transcribing || it.status === "error" ? null : heardNoSpeech(it) ? (
+          // The job ran to the end and Whisper produced nothing: silence, music, or
+          // speech too faint to decode. A result, not a failure.
+          <p className="mt-0.5 text-[11px] text-muted-foreground">nenhuma fala detectada</p>
+        ) : (
+          // Saved but never transcribed. Said out loud, because the alternative is
+          // a card that just stops after the caption and leaves the reason to
+          // guesswork. Transcribing happens on the post itself — the ⧉ above opens it.
+          <p className="mt-0.5 text-[11px] text-muted-foreground">sem transcrição</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Grid({ children }) {
+  // grid-cols-2 holds at 260px (two ~106px tiles); the tiles' own content all
+  // truncates or wraps, so nothing inside them pushes the page wider.
+  return <div className="grid min-w-0 grid-cols-2 gap-2.5">{children}</div>;
+}
+
+// Wipes a whole store with no undo, so the first tap only arms the button and a
+// second one commits. window.confirm is not an option: a native dialog belongs to
+// the parent tab and would sit behind the side panel, unreachable.
+// `title` says what THIS button would wipe. It matters now that there is more
+// than one of them on screen: the row header wipes everything, each platform
+// header wipes only its own group, and the two look alike.
+function ClearAllButton({ onConfirm, className, children, title }) {
+  const [armed, setArmed] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!armed) return;
+    const timer = setTimeout(() => setArmed(false), 4000);
+    // Capture phase, so a handler that stops propagation can't leave it armed.
+    const disarm = (e) => { if (!ref.current?.contains(e.target)) setArmed(false); };
+    document.addEventListener("pointerdown", disarm, true);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("pointerdown", disarm, true);
+    };
+  }, [armed]);
+
+  return (
+    <button
+      ref={ref}
+      title={armed ? "Toque de novo para confirmar" : title}
+      className={
+        armed
+          ? "flex flex-none items-center gap-1 rounded-md border border-destructive/40 bg-destructive/10 px-1.5 py-0.5 text-[11px] font-medium text-destructive"
+          : className
+      }
+      onClick={() => {
+        if (!armed) { setArmed(true); return; }
+        setArmed(false);
+        onConfirm();
+      }}
+    >
+      {armed ? <><Trash2 size={11} /> Confirmar?</> : children}
+    </button>
+  );
+}
+
+// Repair for cards whose thumbnail link expired. Hidden while there is nothing
+// to repair — a button that always says "0" is noise — and it reports what the
+// sweep could NOT fix, because "2 não recuperadas" (a private or deleted post)
+// is a result, not a failure to hide.
+function RecoverThumbsButton({ pending, sweep, onClick }) {
+  if (!pending && !sweep.running) return null;
+  return (
+    <button
+      type="button"
+      disabled={sweep.running}
+      onClick={onClick}
+      title="Baixa as miniaturas de novo e guarda os bytes — links de CDN assinados expiram em poucos dias"
+      className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-60"
+    >
+      <ImageOff size={11} />
+      {sweep.running ? `recuperando… ${sweep.done}/${sweep.total}` : `recuperar miniaturas (${pending})`}
+    </button>
+  );
+}
+
+function RecoverThumbsNote({ sweep }) {
+  if (sweep.running || !sweep.total || !sweep.failed) return null;
+  return (
+    <p className="text-[11px] text-muted-foreground">
+      {sweep.fixed} miniatura{sweep.fixed === 1 ? "" : "s"} recuperada{sweep.fixed === 1 ? "" : "s"}, {sweep.failed} sem
+      resposta da plataforma (post privado, removido ou sem incorporação pública).
+    </p>
+  );
+}
+
+
+// ---- Transcripts tab ----
+export default function TranscriptsPanel() {
+  const items = useStore(TKEY);
+  const saved = useStore(SKEY);
+  const savedIds = new Set(saved.map((s) => s.videoId));
+  const progress = useTxProgress();
+  // One port for the whole tab, shared by every card — the card whose videoId
+  // matches the tick is the one that lights up.
+  const playhead = usePlayhead();
+  const thumbs = useThumbRecovery(items);
+  // A delete that removed nothing used to leave the card sitting there in silence —
+  // the same thing a button with no handler does. Say so on the card instead.
+  const [failed, setFailed] = useState({});
+
+  const toggleSave = (it) => toggleSavedEntry(it);
+  const deleteOne = async (id) => {
+    const res = await removeTranscript(id);
+    if (!removalFailed(res)) return;
+    setFailed((f) => ({ ...f, [id]: res?.error || "não foi possível excluir — recarregue a extensão" }));
+  };
+  const clearAll = async () => {
+    const res = await clearTranscripts();
+    setFailed(removalFailed(res) ? { all: res?.error || "não foi possível limpar — recarregue a extensão" } : {});
+  };
+
+  return (
+    <div className="space-y-2.5">
+      <ReloadHint />
+      {/* Always on screen, empty Library included — that is exactly when the next
+          transcription's language is about to matter. */}
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 pt-1">
+        <span className="text-xs font-medium text-foreground">
+          {items.length ? `${items.length} ${items.length === 1 ? "transcrição" : "transcrições"}` : "Idioma"}
+        </span>
+        <div className="flex flex-none items-center gap-2">
+          <TxLanguageToggle />
+          <RecoverThumbsButton pending={thumbs.pending} sweep={thumbs.sweep} onClick={thumbs.start} />
+          {items.length > 0 && (
+            <ClearAllButton className="text-[11px] text-muted-foreground hover:text-foreground" onConfirm={clearAll}>limpar tudo</ClearAllButton>
+          )}
+        </div>
+      </div>
+      <RecoverThumbsNote sweep={thumbs.sweep} />
+      {failed.all && <p className="break-words text-[11px] text-destructive">{failed.all}</p>}
+      {items.length === 0 ? (
+        <p className="py-10 text-center text-xs text-muted-foreground leading-relaxed">
+          Ainda não há transcrições.<br />
+          Toque em <span className="font-medium text-foreground">Transcrever</span> em um vídeo no
+          Facebook, Instagram ou TikTok — ele aparece aqui.
+        </p>
+      ) : (
+        <>
+          <Grid>
+            {items.map((it) => (
+              <VideoCard
+                key={it.videoId}
+                it={it}
+                saved={savedIds.has(it.videoId)}
+                onToggleSave={() => toggleSave(it)}
+                onDelete={() => deleteOne(it.videoId)}
+                deleteError={failed[it.videoId]}
+                progress={isTranscribing(it, "transcripts") ? progress[it.videoId] : null}
+                playhead={playhead}
+                transcribing={isTranscribing(it, "transcripts")}
+                onThumbError={thumbs.markBroken}
+              />
+            ))}
+          </Grid>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---- Saved tab (grouped: platform → page, each a 2-col grid) ----
+const PLATFORM_META = {
+  facebook: { label: "Facebook", color: "#1877F2" },
+  instagram: { label: "Instagram", color: "#E1306C" },
+  tiktok: { label: "TikTok", color: "#111827" },
+  pinterest: { label: "Pinterest", color: "#e60023" },
+};
+
+export function SavedPanel() {
+  const saved = useStore(SKEY);
+  // Saved cards carry transcripts too, so they follow the tab the same way.
+  const playhead = usePlayhead();
+  const thumbs = useThumbRecovery(saved);
+  const [collapsed, toggleCollapsed] = useCollapsedGroups();
+  // Same control row the search tools carry, over the ONE saved-record shape —
+  // see lib/savedSort.js. Not persisted, unlike the folds: an ordering is a way
+  // of looking at the list right now, and "Padrão" is the order the store keeps.
+  const [sortKey, setSortKey] = useState("default");
+  const [sortDir, setSortDir] = useState("desc");
+
+  if (!saved.length) {
+    return (
+      <div className="py-10 text-center text-xs text-muted-foreground">
+        Ainda não há vídeos salvos.<br />Toque no ícone <Bookmark size={12} className="inline -mt-0.5" /> em uma transcrição para salvá-la aqui.
+      </div>
+    );
+  }
+
+  const groups = {};
+  for (const it of saved) {
+    const p = it.platform || "facebook";
+    (groups[p] ||= []).push(it);
+  }
+  const platforms = Object.keys(groups).sort();
+
+  return (
+    <div className="space-y-3">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1">
+        <span className="text-xs font-medium text-foreground">{saved.length} {saved.length === 1 ? "salvo" : "salvos"}</span>
+        <div className="flex flex-none items-center gap-2">
+        <RecoverThumbsButton pending={thumbs.pending} sweep={thumbs.sweep} onClick={thumbs.start} />
+        <ClearAllButton className="text-[11px] text-muted-foreground hover:text-foreground flex items-center gap-1" onConfirm={() => removeSavedEntry(saved.map((x) => x.videoId))}>
+          <Trash2 size={11} /> limpar tudo
+        </ClearAllButton>
+        </div>
+      </div>
+      <RecoverThumbsNote sweep={thumbs.sweep} />
+
+      <ToolBar>
+        <ToolSelect label="Ordenar por" value={sortKey} onValueChange={setSortKey} options={SAVED_SORT_OPTS} />
+        <ToolIconButton
+          icon={sortDir === "desc" ? ArrowDown : ArrowUp}
+          label={sortDir === "desc" ? "Maior → menor" : "Menor → maior"}
+          hint={
+            sortKey === "default"
+              ? "A ordem Padrão é a ordem em que você salvou — escolha um critério para inverter"
+              : sortDir === "desc"
+                ? "Maior → menor"
+                : "Menor → maior"
+          }
+          onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}
+        />
+      </ToolBar>
+
+      {platforms.map((p) => {
+        const meta = PLATFORM_META[p] || { label: p, color: "#888" };
+        // Sorted per group, because the grid is grouped by platform: one ordering
+        // across the whole store would be invisible with the groups in between.
+        const items = sortSavedRecords(groups[p], sortKey, sortDir);
+        const open = !collapsed[p];
+        return (
+          <div key={p} className="space-y-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <button
+                onClick={() => toggleCollapsed(p)}
+                aria-expanded={open}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+              >
+                <ChevronDown size={14} className={`transition-transform duration-[180ms] ease-[var(--sw-ease)] ${open ? "" : "-rotate-90"}`} />
+                <span className="h-2.5 w-2.5 rounded-full" style={{ background: meta.color }} />
+                <span className="min-w-0 truncate text-sm font-semibold text-foreground">{meta.label}</span>
+                <span className="text-[11px] text-muted-foreground">{items.length}</span>
+              </button>
+              {/* This platform only. The background takes a list of ids, so the
+                  other groups are simply not in it — "limpar tudo" above is the
+                  same call over every id. Two taps, like the one above. */}
+              <ClearAllButton
+                className="flex flex-none items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                onConfirm={() => removeSavedEntry(items.map((x) => x.videoId))}
+                title={`Remover os ${items.length} salvos de ${meta.label}`}
+              >
+                <Trash2 size={11} /> limpar
+              </ClearAllButton>
+            </div>
+            {open && (
+              <Grid>
+                {items.map((it) => (
+                  <VideoCard
+                    key={it.videoId}
+                    it={it}
+                    saved
+                    playhead={playhead}
+                    onToggleSave={() => removeSavedEntry(it.videoId)}
+                    transcribing={isTranscribing(it, "saved")}
+                    onThumbError={thumbs.markBroken}
+                  />
+                ))}
+              </Grid>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

@@ -1,0 +1,1615 @@
+// Instagram capture — runs in the PAGE's MAIN world at document_start.
+//
+// IG parses its feed/post JSON on the main thread, so hooking JSON.parse here
+// catches every media object with clean fields (author, caption, like/comment/play
+// counts, video_versions URL, thumb). We relay compact records to our isolated
+// content script via window.postMessage (the two worlds share the DOM, not JS).
+
+(function () {
+  if (window.__fbwIgMainInit) return;
+  window.__fbwIgMainInit = true;
+  // The Spy batch tab opens with this hash. Opening the profile's Reels tab
+  // (an in-page navigation) drops it, so it is read once, here.
+  const SPY_HASH = "#socialmate-spy";
+  const SPY_TAB = location.hash === SPY_HASH;
+  const isSpyTab = () => SPY_TAB || location.hash === SPY_HASH;
+
+  // Depth-capped: media objects sit well within 20 levels; the cap keeps a
+  // pathological payload from hanging the main thread mid-JSON.parse.
+  // Node budget alongside the depth cap: depth alone doesn't bound a wide payload
+  // (a 50k-element array is depth 2), and this runs inside the page's JSON.parse.
+  const NODE_BUDGET = 50000;
+  function* findMedia(o, seen, depth) {
+    if (!o || typeof o !== "object" || seen.has(o) || depth > 20) return;
+    if (seen.size > NODE_BUDGET) return;
+    seen.add(o);
+    // A carousel's slides are part of that ONE post (carouselOf reads them), never
+    // posts of their own. They used to be told apart by having no shortcode; since
+    // 2026-09 Instagram ships a `code` on every slide too (verified on
+    // /iivymooon/: a 3-slide carousel listed as 4 cards), so the slide itself is
+    // refused (carousel_parent_id) and the walk never descends into carousel_media.
+    if (o.carousel_parent_id) return;
+    if (o.video_versions || (o.code && o.image_versions2) || (o.media_type != null && (o.image_versions2 || o.carousel_media))) yield o;
+    if (Array.isArray(o)) { for (const v of o) yield* findMedia(v, seen, depth + 1); }
+    else { for (const k in o) if (k !== "carousel_media") yield* findMedia(o[k], seen, depth + 1); }
+  }
+
+  function mediaTypeName(m) {
+    if (m.media_type === 8 || m.carousel_media) return "carousel";
+    if (m.media_type === 2 || m.video_versions) return "video";
+    return "photo";
+  }
+  function bestImage(m) {
+    const c = m.image_versions2 && m.image_versions2.candidates;
+    return (c && c[0] && c[0].url) || null;
+  }
+  function carouselOf(m) {
+    if (!m.carousel_media) return null;
+    return m.carousel_media.map((ch) => ({
+      media_type: mediaTypeName(ch),
+      image: bestImage(ch),
+      video: (ch.video_versions && ch.video_versions[0] && ch.video_versions[0].url) || null,
+    }));
+  }
+
+  // Profile-grid payloads omit video_duration, but include the same video's
+  // DASH manifest (observed 2026-10-15). Read its presentation duration without
+  // fetching media/info or confusing it with the soundtrack/preview length.
+  function videoDuration(m) {
+    if (Number.isFinite(m.video_duration) && m.video_duration > 0) return m.video_duration;
+    if (typeof m.video_dash_manifest !== "string") return null;
+    const mpd = m.video_dash_manifest.match(/<MPD\b[^>]*>/i);
+    const duration = mpd && mpd[0].match(/\bmediaPresentationDuration\s*=\s*(["'])PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?\1/);
+    if (!duration) return null;
+    const seconds = Number(duration[2] || 0) * 3600 + Number(duration[3] || 0) * 60 + Number(duration[4] || 0);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  }
+
+  function lite(m) {
+    const u = m.user || m.owner || {};
+    const img = m.image_versions2 && m.image_versions2.candidates && m.image_versions2.candidates[0];
+    const vid = m.video_versions && m.video_versions[0];
+    // Both names, always, whichever one the payload shipped. The profile-grid
+    // connection sends the shortcode alone, and a record with no pk is a record
+    // the per-media enrichment refuses (so its views stay a hole) and the player
+    // rail cannot match (see src/lib/shared/igCode.js). `igIdBase` also strips the
+    // owner suffix off IG's `id`, which used to land in `pk` whole and 404 the
+    // enrichment URL.
+    const code = m.code || null;
+    const pk = igIdBase(m.pk || m.id || "") || (code ? igPkFromCode(code) : null) || "";
+    return {
+      code,
+      pk,
+      username: u.username || null,
+      full_name: u.full_name || null,
+      verified: !!u.is_verified,
+      caption: (m.caption && m.caption.text && m.caption.text.slice(0, 500)) || null,
+      // The whole caption (to 20,000) rides beside the preview for the research
+      // export; the bridge keeps it out of the panel's list.
+      caption_full: (m.caption && m.caption.text && m.caption.text.slice(0, 20000)) || null,
+      product_type: m.product_type || null,
+      like_count: m.like_count != null ? m.like_count : null,
+      comment_count: m.comment_count != null ? m.comment_count : null,
+      play_count: igViewCount(m),
+      // Facebook plays of a cross-posted reel — a different audience, never folded
+      // into play_count.
+      fb_play_count: typeof m.fb_play_count === "number" ? m.fb_play_count : null,
+      thumb: img ? img.url : null,
+      video: vid ? vid.url : null,
+      // Every rendition with its size: the analysis tab picks one near 720p. The
+      // bridge keeps these out of the panel's list.
+      video_variants: Array.isArray(m.video_versions)
+        ? m.video_versions.filter((v) => v && v.url).slice(0, 8)
+          .map((v) => ({ w: v.width != null ? v.width : null, h: v.height != null ? v.height : null, url: v.url }))
+        : null,
+      duration: videoDuration(m),
+      media_type: mediaTypeName(m),
+      image: bestImage(m),
+      carousel: carouselOf(m),
+      taken_at: m.taken_at != null ? m.taken_at : (m.taken_at_timestamp != null ? m.taken_at_timestamp : null),
+      // Who pinned it to the top of their grid: pinned posts carry old dates and
+      // say nothing about the days in between (Spy posts per day).
+      pinned_by: Array.isArray(m.timeline_pinned_user_ids) || Array.isArray(m.clips_tab_pinned_user_ids)
+        ? [...(m.timeline_pinned_user_ids || []), ...(m.clips_tab_pinned_user_ids || [])].map(String)
+        : null,
+      // A collab lists every co-author; it counts in each one's posts per day.
+      coauthors: Array.isArray(m.coauthor_producers)
+        ? m.coauthor_producers.map((c) => ({ id: c && c.pk != null ? String(c.pk) : (c && c.id != null ? String(c.id) : null),
+          username: (c && c.username) || null }))
+        : null,
+      repost: m.media_repost_count != null ? m.media_repost_count : null,
+      // Who posted it, so the creator stats collected below can be joined on.
+      userid: u.pk != null ? String(u.pk) : (u.id != null ? String(u.id) : null),
+      // The sound it rides: audio_id deep-links to every other reel using it.
+      ...(igAudioInfo(m) || {}),
+    };
+  }
+
+  // ---- creator stats (item 2) ----
+  // User dicts ride along in payloads we already parse — profile headers, search
+  // results, suggested-user rails. Collecting them costs no request and turns a
+  // list of posts into a list of CREATORS: views per follower, small accounts
+  // punching above their size, a bio and a link to contact them by.
+  const users = new Map(); // userid -> stats
+  function* findUsers(o, seen, depth) {
+    if (!o || typeof o !== "object" || seen.has(o) || depth > 20) return;
+    if (seen.size > NODE_BUDGET) return;
+    seen.add(o);
+    if (o.username && (o.follower_count != null || o.media_count != null)) yield o;
+    if (Array.isArray(o)) { for (const v of o) yield* findUsers(v, seen, depth + 1); }
+    else { for (const k in o) yield* findUsers(o[k], seen, depth + 1); }
+  }
+  function scanUsers(root) {
+    const out = [];
+    try {
+      const seen = new Set();
+      for (const u of findUsers(root, seen, 0)) {
+        const stats = igUserStats(u);
+        if (!stats) continue;
+        const prev = users.get(stats.userid);
+        const next = mergeIgRecord(prev, stats);
+        users.set(stats.userid, next);
+        if (sameIgUserStats(prev, next)) continue;
+        out.push({ __kind: "user", ...next });
+      }
+      while (users.size > 400) users.delete(users.keys().next().value);
+    } catch (_) {}
+    send(out);
+  }
+
+  // ---- stories & highlights (passive) ----
+  // A "reel" is one highlight or one live-story tray. When you open one, IG
+  // fetches the whole reel via /graphql/query (JS-parsed → this hook sees it).
+  // We emit the reel container (title/cover/owner) + each story item, tagged
+  // with __kind so the bridge routes them to a separate store.
+  function* findReels(o, seen, depth) {
+    if (!o || typeof o !== "object" || seen.has(o) || depth > 22) return;
+    if (seen.size > NODE_BUDGET) return;
+    seen.add(o);
+    if (o.id && Array.isArray(o.items) && o.items.length &&
+        (o.reel_type || String(o.id).indexOf("highlight:") > -1)) yield o;
+    if (Array.isArray(o)) { for (const v of o) yield* findReels(v, seen, depth + 1); }
+    else { for (const k in o) yield* findReels(o[k], seen, depth + 1); }
+  }
+  function pickCover(reel) {
+    const cm = reel.cover_media;
+    if (cm) {
+      const c = cm.cropped_image_version || cm.full_image_version;
+      if (c && c.url) return c.url;
+      const cand = cm.image_versions2 && cm.image_versions2.candidates && cm.image_versions2.candidates[0];
+      if (cand) return cand.url;
+    }
+    const it = reel.items && reel.items[0];
+    return it ? bestImage(it) : null; // live stories have no cover → first frame
+  }
+  // Swipe-up / link-sticker destinations on a story — competitors' actual funnel
+  // URLs. Defensive: IG's shape is story_link_stickers[].story_link.url, but we
+  // walk for any url-ish field so a rename degrades instead of dropping the link.
+  function storyLinks(item) {
+    const out = [];
+    const seen = new Set();
+    const push = (u) => { if (u && /^https?:/.test(u) && !seen.has(u)) { seen.add(u); out.push(u); } };
+    const stickers = item.story_link_stickers || item.link_stickers || [];
+    for (const s of Array.isArray(stickers) ? stickers : []) {
+      const link = s.story_link || s.link || s;
+      push(link && (link.url || link.web_uri || link.link_url || link.deeplink_url));
+    }
+    // Also catch CTA/bio link shapes some story payloads use.
+    if (item.story_cta_url) push(item.story_cta_url);
+    return out;
+  }
+  function liteStory(item, reelId, ownerUsername) {
+    const img = item.image_versions2 && item.image_versions2.candidates && item.image_versions2.candidates[0];
+    const vid = item.video_versions && item.video_versions[0];
+    const links = storyLinks(item);
+    return {
+      __kind: "story",
+      pk: String(item.pk || item.id || ""),
+      reel_id: reelId,
+      owner_username: ownerUsername || null,
+      media_type: mediaTypeName(item),
+      image: bestImage(item),
+      video: vid ? vid.url : null,
+      thumb: img ? img.url : null,
+      carousel: carouselOf(item),
+      caption: (item.caption && item.caption.text && item.caption.text.slice(0, 500)) || null,
+      taken_at: item.taken_at != null ? item.taken_at : null,
+      expiring_at: item.expiring_at != null ? item.expiring_at : null,
+      duration: item.video_duration != null ? Math.round(item.video_duration) : null,
+      code: item.code || null,
+      links: links.length ? links : null,
+    };
+  }
+  const reelSent = new Map(); // reel_id / "s:"+pk -> signature
+  const reelAll = new Map();  // same keys -> record, for replay
+  function scanReels(root) {
+    const out = [];
+    try {
+      const seen = new Set();
+      for (const reel of findReels(root, seen, 0)) {
+        const reelId = String(reel.id);
+        const owner = reel.user ? reel.user.username || null : null;
+        const meta = {
+          __kind: "reel",
+          reel_id: reelId,
+          reel_type: reel.reel_type || (reelId.indexOf("highlight:") > -1 ? "highlight" : "user_reel"),
+          title: reel.title || null,
+          owner: reel.user ? { pk: String(reel.user.pk || ""), username: owner } : null,
+          cover: pickCover(reel),
+          item_count: reel.items.length,
+        };
+        const sig = `${meta.title}|${reel.items.length}`;
+        if (reelSent.get(reelId) !== sig) {
+          reelSent.set(reelId, sig);
+          reelAll.set(reelId, meta);
+          out.push(meta);
+        }
+        for (const item of reel.items) {
+          const s = liteStory(item, reelId, owner);
+          if (!s.pk) continue;
+          const k = "s:" + s.pk;
+          if (reelSent.get(k) === "1") continue;
+          reelSent.set(k, "1");
+          reelAll.set(k, s);
+          out.push(s);
+        }
+      }
+      while (reelAll.size > 600) reelAll.delete(reelAll.keys().next().value);
+      while (reelSent.size > 600) reelSent.delete(reelSent.keys().next().value);
+    } catch (_) {}
+    send(out);
+  }
+
+  const sent = new Map(); // key -> signature (avoid resending unchanged)
+  const all = new Map();  // key (code & pk) -> latest record, for replay
+  function send(records) { if (records.length) window.postMessage({ __fbwIg: true, records }, location.origin); }
+// <<< inline:src/lib/shared/igCode.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/igCode.js and run `npm run gen:inline`.
+// The two names Instagram gives the same media, and how to get from one to the
+// other. INLINED into content scripts — see src/lib/shared/README.md before
+// editing (no imports allowed in this file).
+//
+// A media has a numeric `pk` (3964608873797160540) and a shortcode
+// (DcFHsPsCo5c), and the shortcode is just the pk written in base64url with
+// Instagram's alphabet — so either one yields the other with no request. Verified
+// live in both directions on media captured this session (2026-08-31):
+//   3964608873797160540 <-> DcFHsPsCo5c   (a profile-grid post)
+//   3974000808306592589 <-> DcmfK4UOstN   (a /reels/ player)
+//
+// WHY THIS EXISTS. Payloads disagree about which name they ship. The profile-grid
+// GraphQL connection gives the shortcode and NO pk, so `lite()` stored `pk: ""`,
+// and two things broke downstream, both measured live:
+//
+//  1. The post modal's floating rail never appeared. The MAIN world stamps the
+//     player with the pk it reads off React props, the bridge looks that pk up
+//     among the captured records, and no record from a grid had one to match —
+//     so opening a post from the grid lost the rail (stats, save, download,
+//     transcribe) that the tile behind it was already showing.
+//  2. Per-media enrichment never fired for those records: `needsEnrichment()`
+//     refuses without a pk, so /api/v1/media/<pk>/info/ was never asked and the
+//     views stayed a hole on exactly the surface that omits them.
+//
+// Deriving the missing half fixes both at the source, and costs one bigint loop.
+
+// Instagram's base64url alphabet, in value order.
+const IG_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/**
+ * The bare media id in `value`.
+ *
+ * Instagram's `id` field is "<pk>_<ownerid>" while its `pk` field is the pk
+ * alone; a comparison that keeps the suffix silently never matches.
+ */
+function igIdBase(value) {
+  const s = value == null ? "" : String(value).trim();
+  return s.split("_")[0];
+}
+
+/** Is `value` a bare numeric media pk? */
+function isPk(value) {
+  return /^[0-9]+$/.test(value);
+}
+
+/** The shortcode for a media pk, or null if `pk` is not one. */
+function igCodeFromPk(pk) {
+  const base = igIdBase(pk);
+  if (!isPk(base)) return null;
+  let n = BigInt(base);
+  if (n === 0n) return IG_B64[0];
+  let out = "";
+  while (n > 0n) {
+    out = IG_B64[Number(n % 64n)] + out;
+    n /= 64n;
+  }
+  return out;
+}
+
+/** The numeric pk for a shortcode, or null if `code` is not one. */
+function igPkFromCode(code) {
+  const s = code == null ? "" : String(code).trim();
+  if (!s || !/^[A-Za-z0-9_-]+$/.test(s)) return null;
+  let n = 0n;
+  for (const ch of s) {
+    const v = IG_B64.indexOf(ch);
+    if (v < 0) return null;
+    n = n * 64n + BigInt(v);
+  }
+  return n.toString();
+}
+
+/**
+ * Does `rec` name the media that `ref` refers to?
+ *
+ * `ref` is whatever identifier the caller has — a shortcode, a pk, or an
+ * Instagram `id` with its owner suffix — and both sides are reduced to the pk
+ * before comparing, so a record captured with only a shortcode still answers to
+ * the pk a player was stamped with.
+ */
+function igRefMatches(rec, ref) {
+  if (!rec) return false;
+  const want = igIdBase(ref);
+  if (!want) return false;
+  if (rec.code && String(rec.code) === want) return true;
+  const wantPk = isPk(want) ? want : igPkFromCode(want);
+  if (!wantPk) return false;
+  for (const field of [rec.pk, rec.id]) {
+    const have = igIdBase(field);
+    if (have && isPk(have) && have === wantPk) return true;
+  }
+  return rec.code ? igPkFromCode(rec.code) === wantPk : false;
+}
+// >>> inline:end
+// <<< inline:src/lib/shared/igFilters.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/igFilters.js and run `npm run gen:inline`.
+// Panel-side knobs for the Instagram tool that the page ALSO needs — the overlay
+// draws the same ER the panel sorts by, and the auto-scroll runs in the page.
+// Canonical source, inlined into the capture scripts (see ./README.md).
+
+// DATE_RANGES / withinDateRange / scrollGapMs used to live here. Nothing in them
+// was Instagram — TikTok's createTime is the same unix-seconds stamp and the
+// scroll cadence is the same anti-automation shape — so they moved to
+// ./harvest.js, where the TikTok scripts can inline them without dragging
+// Instagram's ER weights and React prop reader along.
+
+// ---- ER weights (item 5) ----
+// Defaults match IG Sorter's, which is what these numbers were copied from: a
+// comment and a repost each cost far more intent than a like.
+const ER_WEIGHTS = { like: 1, comment: 4, repost: 4 };
+const ER_WEIGHTS_KEY = "fbw_ig_er_weights"; // storage.local — panel writes, page reads
+
+/** Per-field fallback: one junk value must not throw away the other two. */
+function normalizeErWeights(w) {
+  const out = { ...ER_WEIGHTS };
+  if (!w || typeof w !== "object") return out;
+  for (const k of Object.keys(ER_WEIGHTS)) {
+    const n = Number(w[k]);
+    if (Number.isFinite(n) && n >= 0) out[k] = n;
+  }
+  return out;
+}
+
+// ---- React-props media resolution (item 8) ----
+// The full-screen /reels/ player renders no <a> around the video, so an
+// anchor-based overlay finds nothing there. Instagram's own props do carry an
+// identifier — a shortcode on some surfaces, a media id or the video's FB id on
+// others — so the overlay resolves whichever one is present and looks it up.
+const CODE_RE = /\/(?:reel|p|tv)\/([A-Za-z0-9_-]+)/;
+
+function readReactMediaRef(props) {
+  if (!props || typeof props !== "object") return null;
+  const code = props.post && props.post.code;
+  if (code) return { kind: "code", value: String(code) };
+  const mediaKeyId = props.media$key && props.media$key.id;
+  if (mediaKeyId) return { kind: "id", value: String(mediaKeyId) };
+  if (props.mediaId) return { kind: "id", value: String(props.mediaId) };
+  const fbid = (props.coreVideoPlayerMetaData && props.coreVideoPlayerMetaData.videoFBID) || props.videoFBID;
+  if (fbid) return { kind: "pk", value: String(fbid) };
+  if (props.postId) return { kind: "pk", value: String(props.postId) };
+  const postIdNested = props.post && props.post.id;
+  if (postIdNested) return { kind: "id", value: String(postIdNested) };
+  if (typeof props.href === "string") {
+    const m = props.href.match(CODE_RE);
+    if (m) return { kind: "code", value: m[1] };
+  }
+  return null;
+}
+// >>> inline:end
+// <<< inline:src/lib/shared/igEnrich.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/igEnrich.js and run `npm run gen:inline`.
+// Filling the holes Instagram leaves in a captured record. Canonical source —
+// inlined verbatim into the import-free capture scripts (see ./README.md).
+//
+// WHY THIS EXISTS. Measured live on /explore/search/keyword/?q=%23auralytrend
+// (2026-08-15): the keyword-search SERP query (xdt_fbsearch__top_serp_graphql)
+// returns `view_count: null` for 24 of 24 videos and carries no `play_count` /
+// `ig_play_count` key at all — while like_count and comment_count are present on
+// every one and `like_and_view_counts_disabled` is false. So the views did not
+// move to another field; that endpoint simply stopped shipping them, which is why
+// the overlay's eye row and the panel's views column went blank.
+//
+// The same post read through /api/v1/media/<pk>/info/ answers play_count 52222.
+// So a video with no views is a record with a HOLE, and the hole has a cheap fix:
+// ask for that one media. This module decides when to ask and how to merge the
+// answer; the capture script owns the request itself.
+//
+// This is a deliberate break from "passive only" — until now the IG capture read
+// what Instagram parsed and never called anything.
+//
+// POLICY (2026-09-26, user's call): fire every enrichment the moment its record is
+// captured, all in parallel, the way SortFeed does. The old 1 req/s serial queue
+// (ENRICH_MIN_GAP_MS) made tile N wait ~N seconds for its views — on a 24-tile
+// page the last card sat without views for half a minute while SortFeed showed
+// them at once. The only ordering left is which requests leave first: the tiles
+// on screen (visibleFirst).
+
+// Instagram's web app id — what SortFeed hardcodes. The capture script still
+// prefers the id it sees on Instagram's own requests (it can rotate), but uses
+// this one instead of waiting when no request has carried the header yet.
+const IG_WEB_APP_ID = "936619743392459";
+
+/**
+ * Order a batch of enrichment jobs so the ones for tiles on screen are sent
+ * first. Stable: capture order is kept inside each group.
+ */
+function visibleFirst(jobs, isOnScreen) {
+  const on = [];
+  const off = [];
+  for (const j of jobs) (isOnScreen(j) ? on : off).push(j);
+  return on.concat(off);
+}
+
+// Every key Instagram has shipped a media's view count under, most specific
+// first. Which one a payload uses depends on the endpoint and its age: the v1 API
+// says play_count / ig_play_count, the web SERP says view_count, the legacy
+// GraphQL shape says video_view_count, and some clips payloads say
+// content_views_count. fb_play_count is NOT here — those are Facebook plays of a
+// cross-posted reel, a different audience, kept in their own field.
+const IG_VIEW_KEYS = ["play_count", "ig_play_count", "view_count", "video_view_count", "content_views_count"];
+
+/** The media's Instagram view count, or null when no key carries a number. */
+function igViewCount(m) {
+  if (!m || typeof m !== "object") return null;
+  for (const k of IG_VIEW_KEYS) {
+    const v = m[k];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+/** JSON Instagram serves inline sometimes carries a `for (;;);` anti-hijack prefix. */
+function stripJsonGuard(txt) {
+  return String(txt).replace(/^\s*for\s*\(\s*;;\s*\)\s*;?/, "");
+}
+
+/**
+ * Does this record still need a per-media fetch?
+ *
+ * Only videos: photos and carousels have no view count to recover, and asking for
+ * them would double the request count for nothing. `pk` is what the endpoint is
+ * keyed by, so a record without one can never be asked about.
+ */
+function needsEnrichment(rec) {
+  if (!rec || !rec.pk) return false;
+  if (rec.media_type !== "video") return false;
+  return rec.play_count == null || rec.video == null || rec.taken_at == null;
+}
+
+/**
+ * The "how big is this creator" numbers out of an Instagram user dict, or null if
+ * the object isn't one. These ride along in payloads we already parse — no extra
+ * request — and they are what turns a list of posts into a list of creators worth
+ * modelling (views per follower, small-account outliers, contactable bios).
+ */
+function igUserStats(u) {
+  if (!u || typeof u !== "object") return null;
+  const id = u.pk != null ? String(u.pk) : u.id != null ? String(u.id) : null;
+  if (!id) return null;
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const follower_count = num(u.follower_count);
+  const media_count = num(u.media_count);
+  // A user dict without any of these is a mention/tag stub, not a profile payload.
+  if (follower_count == null && media_count == null) return null;
+  return {
+    userid: id,
+    username: u.username || null,
+    full_name: u.full_name || null,
+    profile_pic_url: u.profile_pic_url || null,
+    is_verified: typeof u.is_verified === "boolean" ? u.is_verified : null,
+    is_private: typeof u.is_private === "boolean" ? u.is_private : null,
+    follower_count,
+    following_count: num(u.following_count),
+    media_count,
+    total_clips_count: num(u.total_clips_count),
+    biography: u.biography || null,
+    external_url: u.external_url || null,
+    is_business: !!u.is_business,
+  };
+}
+
+/**
+ * The sound a reel rides, so a trend can be traced back to its audio: original
+ * sounds first (the creator's own), then a licensed track. `audio_id` deep-links
+ * to instagram.com/reels/audio/<id>/, which lists every reel using it.
+ */
+function igAudioInfo(m) {
+  const meta = m && m.clips_metadata;
+  if (!meta) return null;
+  const orig = meta.original_sound_info;
+  if (orig && orig.audio_asset_id != null)
+    return {
+      audio_id: String(orig.audio_asset_id),
+      audio_author: (orig.ig_artist && orig.ig_artist.username) || null,
+      audio_ms: typeof orig.duration_in_ms === "number" ? orig.duration_in_ms : null,
+    };
+  const track = meta.music_info && meta.music_info.music_asset_info;
+  if (track && track.audio_cluster_id != null)
+    return {
+      audio_id: String(track.audio_cluster_id),
+      audio_author: track.display_artist || null,
+      audio_ms: typeof track.duration_in_ms === "number" ? track.duration_in_ms : null,
+    };
+  return null;
+}
+
+/**
+ * Fold a fresh sighting into a stored one. A later payload is not necessarily a
+ * richer payload — the SERP carries no views, the grid carries no video URL — so
+ * a null in the incoming record means "this payload didn't say", never "it's gone".
+ */
+function mergeIgRecord(prev, next) {
+  if (!prev) return { ...next };
+  const out = { ...prev };
+  for (const [k, v] of Object.entries(next || {})) if (v != null) out[k] = v;
+  return out;
+}
+
+
+// Signed avatar URLs rotate without the profile changing. Keep the latest URL
+// in the replay cache, but do not emit a new sighting just for that rotation.
+function sameIgUserStats(prev, next) {
+  if (!prev || !next) return false;
+  const { profile_pic_url: _prevAvatar, ...a } = prev;
+  const { profile_pic_url: _nextAvatar, ...b } = next;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+// >>> inline:end
+// <<< inline:src/lib/shared/igPlayerHost.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/igPlayerHost.js and run `npm run gen:inline`.
+// Which media on an Instagram page is THE PLAYER — the one a floating, top-level
+// rail may be drawn for — and which is a grid tile that already carries its own
+// in-tile rail. INLINED into content scripts — see src/lib/shared/README.md before
+// editing (no imports allowed in this file).
+//
+// Shared between the MAIN-world stamper (main-world.js `annotateReelPlayer`) and
+// the isolated bridge that draws the rails (bridge.js `renderOverlays`) because
+// both were asking the same question and both were answering it with the ROUTE
+// ALONE: `/^\/(reels?|p)\//` matches, so stamp/draw for every <video> big enough.
+//
+// That is only true when a post page is loaded on its own. Clicking a result on a
+// grid — explore, hashtag search, a profile — pushes /p/<code>/ while THE GRID
+// STAYS MOUNTED behind the modal. Measured live on
+// /explore/search/keyword/?q=%23auralytrend → click (2026-08-25): 25 stamped
+// hosts, 24 of them grid tiles at 279x372 (over the 200px floor) and one real
+// player. Each tile then got a SECOND rail in #sw-ig-layer, which is
+// position:fixed at z-index 2147483000 — above Instagram's own dialog — so 72
+// phantom nodes painted across the open post, and because `.sw-acts` is
+// pointer-events:auto they also swallowed clicks meant for the caption and the
+// comment box. Worse, a tile rail and its phantom showed different media, so the
+// numbers next to the video were another post's.
+//
+// Structure, not route, is the discriminator: a grid tile is wrapped in its own
+// permalink <a>, and the player never is — true for the modal player, the
+// standalone /p/ page and the fullscreen /reels/ player alike, with no dependency
+// on Instagram's dialog markup.
+
+/** Instagram's grid tiles: every one is an anchor to the media's own permalink. */
+const IG_TILE_LINK = 'a[href*="/p/"], a[href*="/reel/"]';
+
+/** The routes that can show a single-media player: /p/, /reel/, /reels/. */
+const IG_PLAYER_ROUTE = /^\/(reels?|p)\//;
+
+/** Is `pathname` a route that can show a player at all? */
+function onIgPlayerRoute(pathname) {
+  return IG_PLAYER_ROUTE.test(pathname == null ? "" : String(pathname));
+}
+
+/**
+ * Is `el` (a <video> or the box around it) part of a grid tile?
+ *
+ * Tolerates anything without `closest` — the callers hand this raw DOM straight
+ * out of a querySelectorAll on a page that is mutating underneath them.
+ */
+function isIgTileMedia(el) {
+  return !!(el && typeof el.closest === "function" && el.closest(IG_TILE_LINK));
+}
+
+/**
+ * May a floating rail be drawn for `el` on `pathname`?
+ *
+ * Both halves matter: off a player route there is no player to draw for, and on
+ * one, everything still wrapped in a permalink is a tile the caller has already
+ * served in place.
+ */
+function isIgPlayerMedia(el, pathname) {
+  return !!el && onIgPlayerRoute(pathname) && !isIgTileMedia(el);
+}
+
+// Where a rail may paint at all. The profile HOVERCARD — hover a username in the
+// feed or a comment thread and Instagram opens a popover with the account's three
+// latest posts — carries real /p/<code>/ anchors, so the tile scan matched them
+// and stamped three full stat rails over a 120px thumbnail each. Measured live on
+// /p/<code>/ → hover the author (2026-08-31): the card is a portal with three
+// 120x120 permalink tiles whose `closest("main")` and `closest('[role=dialog]')`
+// are BOTH null, while every surface a rail belongs on answers one of them —
+// profile/explore grid tiles and the fullscreen /reels/ player sit inside <main>,
+// and the post modal is its own portal inside [role="dialog"] (also outside
+// <main>, so requiring <main> alone would kill the modal's rail).
+//
+// Size is not the discriminator: a narrow window shrinks real grid tiles toward
+// the same 120px, and the card's tiles grow on a wide one.
+
+/** The two containers that hold Instagram's own media surfaces. */
+const IG_RAIL_SURFACE = 'main, [role="dialog"]';
+
+/**
+ * Is `el` inside a surface a rail may annotate (page content or the post modal)?
+ *
+ * False for popovers Instagram renders outside both — today the profile
+ * hovercard. Tolerates anything without `closest`, like the checks above.
+ */
+function onIgRailSurface(el) {
+  return !!(el && typeof el.closest === "function" && el.closest(IG_RAIL_SURFACE));
+}
+// >>> inline:end
+// <<< inline:src/lib/shared/surfaceTracker.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/surfaceTracker.js and run `npm run gen:inline`.
+// The "which page am I on" state machine, shared by Instagram and TikTok.
+// INLINED into content scripts — see src/lib/shared/README.md before editing
+// (no imports allowed here beyond a sibling).
+//
+// WHY THIS EXISTS. Both platforms have DETAIL routes — Instagram's /p/<code>/ and
+// /reel/<code>/, TikTok's /@user/video/<id> — that you reach by clicking a tile in
+// a grid. The URL changes, so a plain path→key function reports a different
+// surface, and two things break, both measured live (2026-09-22):
+//
+//   * Instagram: clicking a tile on /explore/search/keyword/?q=%23soulmate pushes
+//     /p/DNEq_P7KOOz/, whose key was "feed". The panel's surface filter then
+//     dropped all 30 hashtag records — the grid emptied while a post was open.
+//   * TikTok: clicking a tile on /tag/soulmate pushes
+//     /@whatspeterdoingnow/video/7668715391899716886, whose key was
+//     "profile:whatspeterdoingnow". TikTok then loads that page's recommendation
+//     rail — 12 videos by mrbeast, adv.devedores, cinemaaquiagora… — and every one
+//     was stamped as belonging to that profile. Measured: the list went 25 -> 2.
+//
+// A detail route is therefore TRANSPARENT: it does not become the surface. It
+// reports the grid you came from for DISPLAY, while the records it captures are
+// stamped `related:<that grid>` — so the recommendation rail is kept (the picker
+// lists it) without contaminating the hashtag you were actually researching.
+
+/** The bucket a detail route falls back to when nothing preceded it. */
+const ORPHAN_SURFACE = "post";
+
+/** `related:<origin>` — where a detail route's own captures are filed. */
+function relatedSurface(origin) {
+  const o = origin || ORPHAN_SURFACE;
+  return o.startsWith("related:") ? o : "related:" + o;
+}
+
+/** The grid behind a `related:<grid>` key, or the key itself. */
+function relatedOrigin(surface) {
+  const s = surface == null ? "" : String(surface);
+  return s.startsWith("related:") ? s.slice("related:".length) : s;
+}
+
+/**
+ * Build a tracker around a platform's `path,search -> key | null` function, where
+ * `null` means "transparent detail route".
+ *
+ * `read(path, search)` returns `{ view, stamp }`:
+ *   view  — the surface the panel should DISPLAY (a detail route inherits it)
+ *   stamp — the surface records captured right now belong to
+ *
+ * Every caller reads through the same tracker instance, so the MAIN world and the
+ * isolated bridge agree — the surface is decided WHERE AND WHEN a record is
+ * captured, which is the invariant igSurface.js was written for.
+ */
+function makeSurfaceTracker(keyOf) {
+  let last = null; // the last non-transparent surface seen in this document
+  // Closure, not methods on the returned object: every call site destructures
+  // (`const { stamp } = tracker`), and a `this.read(...)` would throw there.
+  const read = (path, search) => {
+    const key = keyOf(path, search);
+    if (key == null) {
+      const view = last || ORPHAN_SURFACE;
+      return { view, stamp: relatedSurface(view) };
+    }
+    last = key;
+    return { view: key, stamp: key };
+  };
+  return {
+    read,
+    /** What the panel should show right now. */
+    view: (path, search) => read(path, search).view,
+    /** What a record captured right now should be stamped with. */
+    stamp: (path, search) => read(path, search).stamp,
+  };
+}
+
+/**
+ * Count captured records per surface, in first-sighting order.
+ *
+ * This is what the panel's page picker lists: the capture store spans a whole SPA
+ * session, so the surfaces you already scrolled are still in there. Showing them
+ * turns "the list is full of stuff from another page" into "pick the page" — the
+ * records were never the problem, the single undifferentiated list was.
+ */
+function tallySurfaces(records) {
+  const counts = new Map();
+  for (const r of records) {
+    const k = r && r.surface;
+    if (!k) continue;
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  const out = [];
+  for (const [key, count] of counts) out.push({ key, count });
+  return out;
+}
+// >>> inline:end
+// <<< inline:src/lib/shared/igSurface.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/igSurface.js and run `npm run gen:inline`.
+// Which Instagram surface a record belongs to. INLINED into content scripts —
+// see src/lib/shared/README.md before editing (no imports allowed in this file
+// beyond a sibling).
+//
+// This is shared between the MAIN-world capture and the isolated bridge because
+// the surface has to be decided WHERE AND WHEN the record is captured, not when it
+// is relayed. The bridge used to stamp `surfaceKey()` at relay time, which is
+// wrong for replays: after "Atualizar" the MAIN world resends everything it ever
+// captured, so records from profile A arrived while the user was on profile B and
+// got labelled `profile:B` — and the username backfill then attributed A's posts
+// to B, defeating the Sort tool's ownership filter.
+//
+// THE REDIRECT THAT BROKE THE HASHTAG BUCKET (measured live 2026-09-22).
+// Instagram no longer serves /explore/tags/<t>/ — it 302s to
+//
+//     /explore/search/keyword/?q=%23<t>
+//
+// This function only ever read `location.pathname`, so every hashtag page fell
+// through to `p.startsWith("/explore")` and was bucketed as plain "explore" —
+// the SAME bucket as the Explore recommendation feed and as every other hashtag.
+// 30 tarot posts captured on #soulmate came back stamped "explore", sitting in a
+// list that already held cars and graduation photos from an earlier Explore visit,
+// and no amount of scrolling removed them. The query string is now load-bearing:
+// pass it in, or hashtags silently pool again.
+
+
+// Top-level IG routes that are features, not usernames. A path like /explore/ or
+// /direct/ must never be read as a profile.
+const IG_RESERVED_SEGMENTS = [
+  "explore",
+  "reels",
+  "reel",
+  "p",
+  "direct",
+  "stories",
+  "accounts",
+  "tv",
+  "guides",
+  "challenges",
+  "about",
+  "legal",
+  "privacy",
+  "terms",
+];
+
+// Routes that show ONE item you arrived at from a grid. They never become the
+// surface — see surfaceTracker.js for why (the panel emptied while a post was
+// open, and the post left the hashtag list it came from).
+const IG_TRANSPARENT = /^\/(?:p|reel|stories|direct|accounts)(?:\/|$)/;
+
+/** `?q=` off a search route: "#soulmate" -> tag:soulmate, "tarot" -> search:tarot. */
+function searchSurface(search) {
+  let q = "";
+  try {
+    q = new URLSearchParams(search || "").get("q") || "";
+  } catch {
+    q = ""; // a malformed query must not throw inside JSON.parse
+  }
+  q = q.trim().toLowerCase();
+  if (!q) return "explore";
+  // A hashtag search and a word search return different result sets (the word one
+  // mixes in accounts and audio), so they stay separate buckets.
+  return q.startsWith("#") ? "tag:" + q.slice(1) : "search:" + q;
+}
+
+/**
+ * `path` is a pathname and `search` a query string (both default to the live
+ * location). Returns the surface key, or **null** for a transparent detail route —
+ * callers must go through `igSurface` (the tracker) rather than use null directly.
+ *
+ *   "tag:<name>" | "search:<term>" | "explore" | "reels" | "profile:<user>"
+ *   | "tagged:<user>" | "saved:<user>" | "feed" | null
+ */
+function igSurfaceKey(path, search) {
+  const p = path == null ? (typeof location !== "undefined" ? location.pathname : "/") : String(path);
+  const q = search == null ? (typeof location !== "undefined" ? location.search : "") : String(search);
+  let m;
+  if (IG_TRANSPARENT.test(p)) return null;
+  if ((m = p.match(/\/explore\/tags\/([^/]+)/))) {
+    try {
+      return "tag:" + decodeURIComponent(m[1]).toLowerCase();
+    } catch {
+      return "tag:" + m[1].toLowerCase(); // a malformed escape must not throw here
+    }
+  }
+  // /explore/search/keyword/, /explore/search/top/, and whatever IG renames it to
+  // next — all of them carry the term in ?q=.
+  if (p.startsWith("/explore/search")) return searchSurface(q);
+  if (p.startsWith("/explore")) return "explore";
+  // The Reels feed AND its player: /reels/ is the tab, /reels/<code>/ is the same
+  // vertical feed with one reel addressed. Found live 2026-09-22 — clicking a reel
+  // from a post page lands on /reels/<code>/, which matched nothing and fell
+  // through to "feed", pooling the Reels feed with the home timeline. Note this is
+  // NOT /reel/<code>/ (singular), which is a permalink out of a grid and stays
+  // transparent.
+  if (/^\/reels(?:\/|$)/.test(p)) return "reels";
+  // Other people's posts that tag this profile: multi-author, so it must NOT be
+  // "profile:<u>" — filterBySurface drops a profile record whose author isn't the
+  // owner, which would empty the tab.
+  if ((m = p.match(/^\/([^/]+)\/tagged\/?$/)) && !IG_RESERVED_SEGMENTS.includes(m[1]))
+    return "tagged:" + m[1].toLowerCase();
+  if ((m = p.match(/^\/([^/]+)\/saved(?:\/|$)/)) && !IG_RESERVED_SEGMENTS.includes(m[1]))
+    return "saved:" + m[1].toLowerCase();
+  if ((m = p.match(/^\/([^/]+)\/?(?:reels\/?)?$/))) {
+    const u = m[1];
+    if (!IG_RESERVED_SEGMENTS.includes(u)) return "profile:" + u;
+  }
+  return "feed";
+}
+
+/**
+ * The live tracker. One instance per document — the MAIN world and the bridge each
+ * hold their own, and both see the same URLs, so they agree.
+ */
+const igSurface = makeSurfaceTracker(igSurfaceKey);
+// >>> inline:end
+// <<< inline:src/lib/shared/igCommentPages.js
+// GENERATED by scripts/gen-inline.mjs — do not edit here.
+// Edit src/lib/shared/igCommentPages.js and run `npm run gen:inline`.
+// A whole Instagram comment thread through the app's REST endpoints, on the
+// user's command ("Coletar todos" in the panel's Comentários). INLINED into the
+// Instagram MAIN world — see src/lib/shared/README.md before editing (no imports
+// allowed in this file).
+//
+// Measured 2026-10-22, logged in, post DeJ9CWsm_YJ (318 comments):
+//   GET /api/v1/media/<pk>/comments/?can_support_threading=true&sort_order=popular
+//     15 comments a page. `next_min_id` is a JSON string
+//     ({cached_comments_cursor, bifilter_token}) passed back as `min_id`; the
+//     next page shares no comment with the first. `has_more_comments` is false
+//     while `has_more_headload_comments` is true: the head flag is the one that
+//     pages. Each comment: pk, text, created_at, comment_like_count,
+//     child_comment_count, preview_child_comments, user{username, is_verified}.
+//   GET /api/v1/media/<pk>/comments/<commentPk>/child_comments/
+//     The first answer held 9 of 10 replies, with has_more_head_child_comments
+//     and next_min_child_cursor (passed back as `min_id`). The tail direction
+//     (has_more_tail_child_comments + next_max_child_cursor → `max_id`) is the
+//     one the Comments Exporter extension pages; both are followed.
+
+const IG_COMMENTS_QUERY = "can_support_threading=true&sort_order=popular";
+
+/** The top-level page after `cursor` (none: the first page). */
+function igCommentsPath(mediaPk, cursor) {
+  const q = IG_COMMENTS_QUERY + (cursor ? "&min_id=" + encodeURIComponent(cursor) : "");
+  return `/api/v1/media/${mediaPk}/comments/?${q}`;
+}
+
+/** A page of a comment's replies; `page` is null for the first, else {dir, cursor}. */
+function igRepliesPath(mediaPk, commentPk, page) {
+  const base = `/api/v1/media/${mediaPk}/comments/${commentPk}/child_comments/`;
+  if (!page || !page.cursor) return base;
+  return base + "?" + (page.dir === "max" ? "max_id=" : "min_id=") + encodeURIComponent(page.cursor);
+}
+
+/** The cursor of the next top-level page, or null at the end of the thread. */
+function igNextCommentsCursor(json) {
+  const more = !!(json && (json.has_more_headload_comments || json.has_more_comments));
+  const cursor = json && json.next_min_id;
+  return more && cursor ? String(cursor) : null;
+}
+
+/** A top-level comment whose replies are not all in its preview. */
+function igNeedsReplies(comment) {
+  const total = Number(comment && comment.child_comment_count) || 0;
+  const shown = Array.isArray(comment && comment.preview_child_comments) ? comment.preview_child_comments.length : 0;
+  return total > shown || !!(comment && (comment.has_more_head_child_comments || comment.has_more_tail_child_comments));
+}
+
+/** The next page of replies, or null when the replies are all in. */
+function igNextRepliesPage(json) {
+  if (json && json.has_more_head_child_comments && json.next_min_child_cursor)
+    return { dir: "min", cursor: String(json.next_min_child_cursor) };
+  if (json && json.has_more_tail_child_comments && json.next_max_child_cursor)
+    return { dir: "max", cursor: String(json.next_max_child_cursor) };
+  return null;
+}
+
+const RATE_WORDS = /feedback_required|rate.?limit|please wait|too many requests|tente novamente mais tarde/i;
+const LOGIN_WORDS = /login_required|checkpoint_required|challenge_required|consent_required|\/accounts\/login|\/challenge\//i;
+
+/**
+ * Why an answer stops the collection, or null when it is a usable page.
+ * "rate_limited" (429 or Instagram's wait message), "login" (logged out, a
+ * checkpoint or a challenge), "bad_response", or "http_<status>".
+ */
+function igCommentBlock({ status, url, redirected, contentType, body }) {
+  const text = typeof body === "string" ? body.slice(0, 4000) : "";
+  if (status === 429 || RATE_WORDS.test(text)) return "rate_limited";
+  if (status === 401 || status === 403 || (redirected && LOGIN_WORDS.test(String(url || ""))) || LOGIN_WORDS.test(text))
+    return "login";
+  if (!(status >= 200 && status < 300)) return "http_" + status;
+  if (!/json/i.test(String(contentType || ""))) return "bad_response";
+  return null;
+}
+
+/** The pause before the next request: 4–8 s, so a 300-comment post takes minutes. */
+function igCommentGapMs(random = Math.random) {
+  return 4000 + Math.floor(random() * 4000);
+}
+// >>> inline:end
+
+  function scan(root) {
+    const out = [];
+    try {
+      const seen = new Set();
+      for (const m of findMedia(root, seen, 0)) {
+        // Require a shortcode: skips carousel children (image objects with a pk
+        // but no code) that would otherwise flood the list as empty-stat cards.
+        if (!m.code) continue;
+        const r = lite(m);
+        // Stamp the surface HERE, where the record is actually seen. The bridge
+        // used to decide it at relay time, which mislabels every replayed record
+        // (see src/lib/shared/igSurface.js).
+        r.__surface = igSurface.stamp();
+        const key = r.code || r.pk;
+        // A later sparse grid payload must not erase duration from bridge replay.
+        if (r.duration == null) r.duration = all.get(key)?.duration ?? null;
+        if (r.code) all.set(r.code, r);
+        if (r.pk) all.set(r.pk, r);
+        // The caption is part of the signature: an edited caption is news too.
+        const sig = `${r.like_count}|${r.comment_count}|${r.play_count}|${r.repost}|${!!r.video}|${r.media_type}|${r.duration}|${(r.caption_full || "").length}|${(r.caption_full || "").slice(-24)}`;
+        if (sent.get(key) !== sig) { sent.set(key, sig); out.push(r); }
+        queueEnrichment(r);
+      }
+      // Cap replay buffers for long SPA sessions (all holds ~2 keys per record:
+      // code and pk). Oldest entries evict first (Map keeps insertion order).
+      while (all.size > 1200) all.delete(all.keys().next().value);
+      while (sent.size > 700) sent.delete(sent.keys().next().value);
+    } catch (_) {}
+    send(out);
+  }
+
+  // ---- comments ----
+  // A post's comment thread travels in three payloads, all verified live on a
+  // logged-in /p/<code>/ (2026-09-26):
+  //   first page  server-rendered: xdt_api__v1__media__media_id__comments__connection
+  //   next pages  PolarisPostCommentsPaginationQuery → the same root, 15 at a time
+  //   replies     PolarisPostChildCommentsQuery →
+  //               xdt_api__v1__media__media_id__comments__parent_comment_id__child_comments__connection
+  // Every node is an XDTCommentDict {pk, text, created_at, comment_like_count,
+  // child_comment_count, parent_comment_id, user{username, pk, is_verified}}.
+  // The nodes don't name their post, so the post is the one the URL names —
+  // comments only render on /p/, /reel/ and /reels/ routes. The record uses the
+  // TikTok comment's field names, so the panel's thread/sort/filter helpers
+  // (src/lib/ttComments.js) serve both platforms unchanged.
+  const COMMENT_ROOT = "xdt_api__v1__media__media_id__comments__";
+  const COMMENT_RE = /^xdt_api__v1__media__media_id__comments__/;
+  const sentIgCom = new Map(); // cid -> signature: a new like or an edit is resent
+  const allIgCom = new Map(); // cid -> record, for replay
+  const numOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : Number.isFinite(+v) && v !== null && v !== "" ? +v : null);
+  function currentPostCode() {
+    const m = location.pathname.match(/\/(?:p|reel|reels)\/([A-Za-z0-9_-]+)/);
+    return m ? m[1] : null;
+  }
+  function liteIgComment(n, post, inChildConn) {
+    const u = n.user || {};
+    const parent = n.parent_comment_id != null && n.parent_comment_id !== "" ? String(n.parent_comment_id) : null;
+    return {
+      __kind: "ig_comment",
+      cid: String(n.pk || n.id || ""),
+      post,
+      text: (n.text || "").slice(0, 2200),
+      digg_count: numOrNull(n.comment_like_count),
+      reply_count: numOrNull(n.child_comment_count),
+      username: u.username || null,
+      nickname: null,
+      verified: !!u.is_verified,
+      create_time: numOrNull(n.created_at),
+      is_reply: !!parent || !!inChildConn,
+      parent,
+    };
+  }
+  const comSig = (c) => `${c.digg_count}|${c.reply_count}|${c.text.length}|${c.text.slice(-24)}`;
+  function scanComments(root) {
+    const post = currentPostCode();
+    if (!post) return;
+    const out = [];
+    const seen = new WeakSet();
+    const stack = [[root, 0]];
+    let budget = 20000;
+    while (stack.length && budget-- > 0) {
+      const [o, d] = stack.pop();
+      if (!o || typeof o !== "object" || seen.has(o) || d > 14) continue;
+      seen.add(o);
+      if (Array.isArray(o)) { for (const v of o) stack.push([v, d + 1]); continue; }
+      for (const k in o) {
+        const v = o[k];
+        if (COMMENT_RE.test(k) && v && Array.isArray(v.edges)) {
+          const child = k.indexOf("child_comments") > -1;
+          for (const e of v.edges) {
+            const n = e && e.node;
+            if (!n || !n.pk) continue;
+            const rec = liteIgComment(n, post, child);
+            allIgCom.set(rec.cid, rec);
+            if (sentIgCom.get(rec.cid) !== comSig(rec)) { sentIgCom.set(rec.cid, comSig(rec)); out.push(rec); }
+            // A reply preview some shapes embed under the parent.
+            for (const pc of Array.isArray(n.preview_child_comments) ? n.preview_child_comments : []) {
+              if (!pc || !pc.pk) continue;
+              const rr = liteIgComment({ parent_comment_id: n.pk, ...pc }, post, true);
+              allIgCom.set(rr.cid, rr);
+              if (sentIgCom.get(rr.cid) !== comSig(rr)) { sentIgCom.set(rr.cid, comSig(rr)); out.push(rr); }
+            }
+          }
+        } else if (v && typeof v === "object") stack.push([v, d + 1]);
+      }
+    }
+    while (allIgCom.size > 10000) allIgCom.delete(allIgCom.keys().next().value);
+    while (sentIgCom.size > 6000) sentIgCom.delete(sentIgCom.keys().next().value);
+    send(out);
+  }
+
+  // ---- views enrichment (item 1) ----
+  // The keyword-search SERP and the profile grid ship no play_count, so a video
+  // captured there arrives with a hole where its views should be.
+  // /api/v1/media/<pk>/info/ still answers with them — it is the same call
+  // Instagram makes when you open a post.
+  //
+  // Every record that needs it is asked about the moment it is captured, all in
+  // parallel (see the POLICY note in src/lib/shared/igEnrich.js). A scan's records
+  // are collected for one tick so the batch can send the tiles on screen first.
+  // The app's own x-ig-app-id is preferred (it rotates); IG_WEB_APP_ID covers the
+  // window before Instagram has sent one.
+  const IG_APP_ID_HEADER = "x-ig-app-id";
+  let igAppId = null;
+  let enrichBatch = [];
+  const enrichAsked = new Set();
+
+  function captureAppId(name, value) {
+    if (!igAppId && String(name).toLowerCase() === IG_APP_ID_HEADER && value) igAppId = String(value);
+  }
+  // Instagram sets the header on its own requests; both transports are hooked
+  // because which one carries a given query changes between releases.
+  const xhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.setRequestHeader = function (n, v) {
+    try {
+      captureAppId(n, v);
+      (this.__fbwHeaders || (this.__fbwHeaders = {}))[n] = v;
+    } catch (_) {}
+    return xhrSetHeader.apply(this, arguments);
+  };
+  const xhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    try { this.__fbwUrl = String(url || ""); } catch (_) {}
+    return xhrOpen.apply(this, arguments);
+  };
+  const xhrSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function (body) {
+    try { noteGridRequest(this.__fbwUrl, body, this.__fbwHeaders); } catch (_) {}
+    return xhrSend.apply(this, arguments);
+  };
+  const origFetch = window.fetch;
+  if (typeof origFetch === "function") {
+    window.fetch = function (input, init) {
+      try {
+        const h = (init && init.headers) || (input && input.headers);
+        if (h) {
+          if (typeof h.get === "function") captureAppId(IG_APP_ID_HEADER, h.get(IG_APP_ID_HEADER));
+          else for (const k in h) captureAppId(k, h[k]);
+        }
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        let headers = null;
+        if (h && typeof h.forEach === "function") { headers = {}; h.forEach((v, k) => { headers[k] = v; }); }
+        else if (h) headers = { ...h };
+        noteGridRequest(url, init && init.body, headers);
+      } catch (_) {}
+      return origFetch.apply(this, arguments);
+    };
+  }
+
+  // ---- Spy: a reading covers the whole week (and a first reading more) ----
+  // A hidden tab never scrolls, so Instagram stops at the first page of the grid
+  // (12 posts) and of the Reels tab (measured 2026-10-05). On request, the next
+  // pages are read here: the query the page itself sent (its tokens and provided
+  // variables), the cursor from its answer, and the pagination doc_id from the
+  // page's own module (the first query's doc_id also answers with an `after`
+  // cursor — measured — and is the fallback). Each answer goes through JSON.parse
+  // like any other, so its posts are captured on the normal path. Bounded: a few
+  // pages, a pause between them, stopping at the oldest day wanted.
+  //
+  // Views live only in the Reels tab, so after the grid the reading clicks the
+  // profile's own Reels link: an in-page navigation, the same two queries a
+  // person clicking it makes.
+  const IG_EPOCH_MS = 1314220021721n;
+  const mintedAt = (pk) => {
+    try { return Number(((BigInt(String(pk).split("_")[0]) >> 23n) + IG_EPOCH_MS) / 1000n); } catch (_) { return null; }
+  };
+  const PAGERS = {
+    grid: {
+      firstQuery: "PolarisProfilePostsQuery",
+      pageQuery: "PolarisProfilePostsTabContentQuery_connection",
+      matches: (name) => name.indexOf("PolarisProfilePosts") === 0,
+      user: (vars) => vars.username,
+      variables: (vars, after, provided) => ({ after, before: null, data: vars.data, first: 12,
+        include_multi_captions: true, last: null, username: vars.username, ...provided }),
+    },
+    reels: {
+      firstQuery: "PolarisProfileReelsTabContentQuery",
+      pageQuery: "PolarisProfileReelsTabContentQuery_connection",
+      matches: (name) => name.indexOf("PolarisProfileReelsTabContentQuery") === 0,
+      user: (vars) => vars.user_id || vars.id || (vars.data && vars.data.target_user_id),
+      variables: (vars, after, provided) => ({ after, data: vars.data, first: 12,
+        id: vars.user_id || vars.id || (vars.data && vars.data.target_user_id), ...provided }),
+    },
+  };
+  const pagerRequest = { grid: null, reels: null }; // { user, url, body, headers }
+  const pagerPage = { grid: null, reels: null }; // { cursor, hasNext, oldest }
+  let deepRunning = false;
+  function noteGridRequest(url, body, headers) {
+    // Instagram moved the profile tabs' queries to /api/graphql on 2026-10-16; the first load still uses /graphql/query.
+    if (typeof body !== "string" || !/\/(graphql\/query|api\/graphql)/.test(String(url))) return;
+    if (body.indexOf("PolarisProfile") === -1) return;
+    const form = new URLSearchParams(body);
+    const name = form.get("fb_api_req_friendly_name") || "";
+    for (const kind in PAGERS) {
+      if (!PAGERS[kind].matches(name)) continue;
+      const user = PAGERS[kind].user(JSON.parse(form.get("variables") || "{}"));
+      if (user) pagerRequest[kind] = { user: String(user).toLowerCase(), url: String(url), body, headers: headers || {} };
+    }
+  }
+  function notePage(kind, conn, dateOf) {
+    if (!conn || !conn.page_info) return;
+    let oldest = null;
+    for (const edge of conn.edges || []) {
+      const m = edge && edge.node && (edge.node.media || edge.node);
+      if (!m || (m.timeline_pinned_user_ids || []).length || (m.clips_tab_pinned_user_ids || []).length) continue;
+      const t = dateOf(m);
+      if (typeof t === "number") oldest = oldest == null ? t : Math.min(oldest, t);
+    }
+    pagerPage[kind] = { cursor: conn.page_info.end_cursor || null, hasNext: !!conn.page_info.has_next_page, oldest };
+  }
+  function noteGridPage(root) {
+    const data = root && root.data;
+    if (!data) return;
+    notePage("grid", data.xdt_api__v1__feed__user_timeline_graphql_connection, (m) => m.taken_at);
+    const dict = data.fetch__XDTUserDict;
+    notePage("reels", dict && dict.clips_connection, (m) => (typeof m.taken_at === "number" ? m.taken_at : mintedAt(m.pk)));
+  }
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // A hidden tab runs timers at most once a second, so waiting by polling every
+  // 200 ms takes 5× longer than it says (measured: 8 s became 40 s). Wake on the
+  // page's own DOM changes instead, with a 1 s check and one deadline.
+  function waitUntil(check, timeoutMs) {
+    return new Promise((resolve) => {
+      if (check()) { resolve(true); return; }
+      let mo = null;
+      const finish = (ok) => { clearInterval(tick); clearTimeout(deadline); if (mo) mo.disconnect(); resolve(ok); };
+      const poke = () => { if (check()) finish(true); };
+      if (typeof MutationObserver === "function" && document.documentElement) {
+        mo = new MutationObserver(poke);
+        mo.observe(document.documentElement, { childList: true, subtree: true });
+      }
+      const tick = setInterval(poke, 1000);
+      const deadline = setTimeout(() => finish(false), timeoutMs);
+    });
+  }
+  async function readMore(kind, user, { maxPages, untilSec }) {
+    const pager = PAGERS[kind];
+    let pages = 0;
+    // The page sends its own first query a moment after load (or after the click).
+    await waitUntil(() => !!(pagerRequest[kind] && pagerPage[kind]), 10000);
+    const req = pagerRequest[kind];
+    if (!req || !pagerPage[kind]) return { ok: false, pages, error: "no_" + kind };
+    const first = new URLSearchParams(req.body);
+    const vars = JSON.parse(first.get("variables") || "{}");
+    if (kind === "grid" && req.user !== user) return { ok: false, pages, error: "no_grid" };
+    const provided = {};
+    for (const k in vars) if (k.indexOf("__relay_internal__") === 0) provided[k] = vars[k];
+    let docId = null;
+    try { docId = window.require(pager.pageQuery + ".graphql").params.id; } catch (_) {}
+    if (!docId) docId = first.get("doc_id");
+    const headers = {};
+    for (const k in req.headers) if (k.toLowerCase() !== "x-fb-friendly-name") headers[k] = req.headers[k];
+    headers["X-FB-Friendly-Name"] = pager.pageQuery;
+    while (pages < (maxPages || 0) && pagerPage[kind].hasNext && pagerPage[kind].cursor &&
+           !(untilSec && pagerPage[kind].oldest != null && pagerPage[kind].oldest <= untilSec)) {
+      await pause(2500 + Math.floor(Math.random() * 2500));
+      const form = new URLSearchParams(req.body);
+      form.set("doc_id", docId);
+      form.set("fb_api_req_friendly_name", pager.pageQuery);
+      form.set("variables", JSON.stringify(pager.variables(vars, pagerPage[kind].cursor, provided)));
+      const r = await origFetch(req.url, { method: "POST", credentials: "include", headers, body: form.toString() });
+      if (!r.ok) return { ok: false, pages, error: r.status === 429 ? "rate_limited" : "http_" + r.status };
+      const cursor = pagerPage[kind].cursor;
+      JSON.parse(await r.text()); // the hook below captures the posts and moves the page
+      pages += 1;
+      if (pagerPage[kind].cursor === cursor) return { ok: false, pages, error: "no_page" };
+    }
+    return { ok: true, pages, done: !pagerPage[kind].hasNext };
+  }
+  async function openReelsTab(user) {
+    // The profile's tabs render a moment after its first query; a profile with
+    // no reels has no Reels tab at all.
+    const find = () => document.querySelector('a[href="/' + user + '/reels/"]');
+    await waitUntil(() => !!find(), 8000);
+    const link = find();
+    if (!link) return false;
+    link.click();
+    // Instagram pushes /<user>/reels/ itself; put the batch hash back after it.
+    await waitUntil(() => /\/reels\/?$/.test(location.pathname), 5000);
+    if (SPY_TAB && location.hash !== SPY_HASH) {
+      try { history.replaceState(history.state, "", location.pathname + location.search + SPY_HASH); } catch (_) {}
+    }
+    return true;
+  }
+  async function readWeek({ username, grid, reels, maxPages, untilSec }) {
+    const user = String(username || "").toLowerCase();
+    const finish = (result) => window.postMessage({ __fbwIgDeepDone: { username: user, ...result } }, location.origin);
+    if (deepRunning) return finish({ ok: false, pages: 0, error: "busy" });
+    deepRunning = true;
+    try {
+      const gridOut = await readMore("grid", user, grid || { maxPages, untilSec });
+      if (!gridOut.ok && gridOut.error === "rate_limited") return finish(gridOut);
+      if (!reels) return finish(gridOut);
+      if (!(await openReelsTab(user))) return finish({ ...gridOut, reelsPages: 0, reelsError: "no_reels_tab" });
+      const reelsOut = await readMore("reels", user, reels);
+      return finish({ ...gridOut, reelsPages: reelsOut.pages, ...(reelsOut.ok ? {} : { reelsError: reelsOut.error }) });
+    } catch (_) {
+      return finish({ ok: false, pages: 0, error: "failed" });
+    } finally {
+      deepRunning = false;
+    }
+  }
+
+  function queueEnrichment(rec) {
+    if (isSpyTab()) return;
+    if (!needsEnrichment(rec) || enrichAsked.has(rec.pk)) return;
+    enrichAsked.add(rec.pk);
+    // The surface travels WITH the pk: stamping the live surface when the answer
+    // lands would file the post under wherever the user has walked to by then.
+    enrichBatch.push({ pk: rec.pk, code: rec.code || null, surface: rec.__surface || igSurface.stamp() });
+    if (enrichAsked.size > 600) enrichAsked.clear(); // long SPA session; re-asking is fine
+    if (enrichBatch.length === 1) setTimeout(flushEnrichment, 0);
+  }
+
+  // Shortcodes of the post tiles inside the viewport, plus the post the URL
+  // itself names (a reel player or post page has no tile link around it).
+  const TILE_CODE_RE = /\/(?:reels?|p|tv)\/([A-Za-z0-9_-]+)/;
+  function onScreenCodes() {
+    const codes = new Set();
+    const own = location.pathname.match(TILE_CODE_RE);
+    if (own) codes.add(own[1]);
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+    for (const a of document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]')) {
+      const m = (a.getAttribute("href") || "").match(TILE_CODE_RE);
+      if (!m || codes.has(m[1])) continue;
+      const r = a.getBoundingClientRect();
+      if (r.width > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw) codes.add(m[1]);
+    }
+    return codes;
+  }
+
+  function flushEnrichment() {
+    const batch = enrichBatch;
+    enrichBatch = [];
+    if (!batch.length) return;
+    let visible = null;
+    try { visible = onScreenCodes(); } catch (_) {}
+    const ordered = visible ? visibleFirst(batch, (j) => !!j.code && visible.has(j.code)) : batch;
+    for (const job of ordered) enrichOne(job);
+  }
+
+  // A tile on screen that no payload ever described — the tab was restored from
+  // cache, the extension was reloaded into an open page, or the parse happened
+  // before this script existed. Instagram's grid props only hold a Relay fragment
+  // ref ({pk, code, __id}; verified live 2026-09-26), with the counts in the
+  // Relay store, so there is nothing richer to read there — but the shortcode IS
+  // the pk (igPkFromCode), and media/info answers for any media type.
+  function enrichUnseenTiles() {
+    if (isSpyTab()) return;
+    if (document.visibilityState !== "visible") return;
+    let codes;
+    try { codes = onScreenCodes(); } catch (_) { return; }
+    for (const code of codes) {
+      if (all.has(code)) continue;
+      const pk = igPkFromCode(code);
+      if (!pk || enrichAsked.has(pk)) continue;
+      enrichAsked.add(pk);
+      enrichBatch.push({ pk, code, surface: igSurface.stamp() });
+      if (enrichBatch.length === 1) setTimeout(flushEnrichment, 0);
+    }
+  }
+  setInterval(enrichUnseenTiles, 1500);
+
+  async function enrichOne({ pk, surface }) {
+    try {
+      const r = await origFetch(`/api/v1/media/${pk}/info/`, {
+        credentials: "include",
+        headers: { [IG_APP_ID_HEADER]: igAppId || IG_WEB_APP_ID, "x-requested-with": "XMLHttpRequest" },
+      });
+      if (!r.ok) return;
+      const j = await r.json();
+      // Straight through the normal path: lite() reads it, the surface stamp and
+      // the replay buffer treat it like any other sighting, and the bridge merges.
+      const items = (j && j.items) || [];
+      const out = [];
+      for (const m of items) {
+        if (!m || !m.code) continue;
+        const rec = lite(m);
+        rec.__surface = surface; // where the post was SEEN, not where we are now
+        const prev = all.get(rec.code);
+        const merged = mergeIgRecord(prev, rec);
+        all.set(rec.code, merged);
+        if (merged.pk) all.set(merged.pk, merged);
+        out.push(merged);
+      }
+      send(out);
+    } catch (_) {
+      /* offline, rate-limited, logged out — the record just keeps its hole */
+    }
+  }
+
+  // ---- comments: a whole thread on request ("Coletar todos" in the panel) ----
+  // The passive capture only has what the page loaded. On the user's command the
+  // post's thread is read through the REST endpoints (igCommentPages.js): top-level
+  // pages first, then the replies of every comment whose preview is short, one
+  // request every 4–8 s. A 429, a wait message or a login wall stops it and keeps
+  // what came in. Each page goes through the normal comment path (liteIgComment →
+  // send), so the panel, the export and the replay treat it like any capture. The
+  // cursors stay per post, so pressing again after a stop carries on.
+  const collect = { code: null, state: "idle", top: 0, replies: 0, total: null, error: null };
+  let collectStop = false;
+  let collectWake = null; // ends the current pause early (Parar)
+  const collectJobs = new Map(); // code -> { cursor, topDone, pending: Map(commentPk -> page|null), top, replies, total }
+  const postCollect = () => window.postMessage({ __fbwIgCollect: { ...collect } }, location.origin);
+  // One timer per pause, never a chain of short ones: Chrome stretches chained
+  // timers in a tab hidden for 5+ minutes to one a minute (measured: a 250 ms
+  // polling pause held the first page for 80+ s).
+  function collectPause(ms) {
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(timer); collectWake = null; resolve(); };
+      const timer = setTimeout(done, ms);
+      collectWake = done;
+    });
+  }
+  async function collectGet(path) {
+    const headers = { "x-csrftoken": (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || "",
+      [IG_APP_ID_HEADER]: igAppId || IG_WEB_APP_ID, "x-requested-with": "XMLHttpRequest" };
+    const r = await origFetch(path, { credentials: "include", headers });
+    const body = await r.text();
+    const block = igCommentBlock({ status: r.status, url: r.url, redirected: r.redirected,
+      contentType: r.headers.get("content-type"), body });
+    if (block) throw Object.assign(new Error(block), { block });
+    return JSON.parse(body);
+  }
+  function collectRecords(code, list, parent) {
+    const out = [];
+    for (const n of list || []) {
+      if (!n || !n.pk) continue;
+      const rec = liteIgComment(parent ? { parent_comment_id: parent, ...n } : n, code, !!parent);
+      allIgCom.set(rec.cid, rec);
+      sentIgCom.set(rec.cid, comSig(rec));
+      out.push(rec);
+    }
+    return out;
+  }
+  async function collectThread(code) {
+    if (collect.state === "running") return;
+    const pk = igPkFromCode(code);
+    if (!pk) { Object.assign(collect, { code, state: "error", error: "bad_code" }); postCollect(); return; }
+    const job = collectJobs.get(code) || { cursor: null, topDone: false, pending: new Map(), top: 0, replies: 0, total: null };
+    collectJobs.set(code, job);
+    collectStop = false;
+    Object.assign(collect, { code, state: "running", error: null, top: job.top, replies: job.replies, total: job.total });
+    postCollect();
+    let first = true;
+    try {
+      while (!collectStop && (!job.topDone || job.pending.size)) {
+        if (!first) await collectPause(igCommentGapMs());
+        first = false;
+        if (collectStop) break;
+        if (!job.topDone) {
+          const j = await collectGet(igCommentsPath(pk, job.cursor));
+          if (typeof j.comment_count === "number") job.total = j.comment_count;
+          const out = [];
+          for (const c of j.comments || []) {
+            out.push(...collectRecords(code, [c], null));
+            const kids = collectRecords(code, c.preview_child_comments, String(c.pk));
+            out.push(...kids);
+            job.replies += kids.length;
+            if (igNeedsReplies(c)) job.pending.set(String(c.pk), null);
+          }
+          job.top += (j.comments || []).length;
+          send(out);
+          job.cursor = igNextCommentsCursor(j);
+          if (!job.cursor) job.topDone = true;
+        } else {
+          const [cpk, page] = job.pending.entries().next().value;
+          const j = await collectGet(igRepliesPath(pk, cpk, page));
+          const out = collectRecords(code, j.child_comments, cpk);
+          job.replies += out.length;
+          send(out);
+          const next = igNextRepliesPage(j);
+          if (next && out.length) job.pending.set(cpk, next);
+          else job.pending.delete(cpk);
+        }
+        Object.assign(collect, { top: job.top, replies: job.replies, total: job.total });
+        postCollect();
+      }
+      collect.state = collectStop ? "stopped" : "done";
+      if (!collectStop) collectJobs.delete(code); // a finished thread starts over next time
+    } catch (e) {
+      Object.assign(collect, { state: e && e.block ? "blocked" : "error", error: (e && e.block) || "network" });
+    }
+    postCollect();
+  }
+
+  const orig = JSON.parse;
+  JSON.parse = function () {
+    const out = orig.apply(this, arguments);
+    if (out && typeof out === "object") {
+      // This hook sits in front of EVERY JSON.parse on instagram.com — Relay/Bloks
+      // payloads, config, logging, third-party libs. `scan` used to run
+      // unconditionally, so every one of those paid for a recursive walk of the whole
+      // object graph plus a Set holding every visited node. An indexOf over the raw
+      // text is ~1µs even on a megabyte; the walk is milliseconds. Sniff first and
+      // only walk payloads that can actually contain media. (The reels path below
+      // already did this — the expensive, far more frequent path was the unguarded one.)
+      const txt = typeof arguments[0] === "string" ? arguments[0] : null;
+      const mediaish =
+        !txt || // non-string input (rare): can't sniff, fall back to walking
+        txt.indexOf("image_versions2") > -1 ||
+        txt.indexOf("video_versions") > -1 ||
+        txt.indexOf("carousel_media") > -1;
+      if (mediaish) scan(out);
+      // Creator stats travel in payloads with no media in them at all (a profile
+      // header, a suggested-users rail), so they get their own sniff.
+      if (mediaish || (txt && txt.indexOf("follower_count") > -1)) scanUsers(out);
+      if (txt && (txt.indexOf("user_timeline_graphql_connection") > -1 || txt.indexOf("clips_connection") > -1)) {
+        try { noteGridPage(out); } catch (_) {}
+      }
+      if (txt && (txt.indexOf("expiring_at") > -1 || txt.indexOf("reel_type") > -1)) scanReels(out);
+      if (txt && txt.indexOf(COMMENT_ROOT) > -1) scanComments(out);
+    }
+    return out;
+  };
+
+  // ---- inline JSON sweep (safety net for the parse hook) ----
+  // Instagram server-renders the first page of a surface into
+  // <script type="application/json"> blobs. The JSON.parse hook normally sees them
+  // when the page's own code parses them, but not when that happened before this
+  // script ran (a tab restored from cache, an extension reload into an open tab)
+  // or when the page reads them some other way. So every second we parse the
+  // blobs that name media ourselves, once each, and feed them through the same
+  // scan. The native parse is used so this never re-enters the hook.
+  const sweptBlobs = new WeakMap(); // <script> -> text length already parsed
+  function sweepJsonBlobs() {
+    if (document.visibilityState !== "visible") return;
+    for (const el of document.querySelectorAll('script[type="application/json"]')) {
+      const txt = el.textContent || "";
+      if (sweptBlobs.get(el) === txt.length) continue;
+      sweptBlobs.set(el, txt.length);
+      const hasMedia = txt.indexOf("image_versions2") > -1 || txt.indexOf("video_versions") > -1;
+      const hasComments = txt.indexOf(COMMENT_ROOT) > -1;
+      if (!hasMedia && !hasComments) continue;
+      let data;
+      try { data = orig.call(JSON, stripJsonGuard(txt)); } catch (_) { continue; }
+      if (hasMedia) { scan(data); scanUsers(data); }
+      if (hasComments) scanComments(data);
+    }
+  }
+  setInterval(sweepJsonBlobs, 1000);
+  sweepJsonBlobs();
+
+  // ---- name the media for the isolated world ----
+  // The reel player (/reels/<code>/, /reel/<code>/) wraps NO <a> around the video,
+  // so the bridge's link scan finds nothing there and the stats rail never
+  // appeared on the surface where it is most wanted.
+  //
+  // Instagram's React props DO name the media (coreVideoPlayerMetaData.videoFBID —
+  // verified live on /reels/DaBFBcgxZIi/), but those props hang off the page's own
+  // JS objects: an ISOLATED-world script sees the same DOM and none of those
+  // properties. Only this script, which runs in the MAIN world, can read them.
+  //
+  // So the MAIN world resolves the reference and writes it back as a DOM
+  // ATTRIBUTE, which both worlds can see. The bridge then treats a stamped
+  // container exactly like a link.
+  const SW_MEDIA_ATTR = "data-sw-media";
+  // Which media each player box was stamped FOR. Identity of the <video> plus its
+  // src is what tells a re-render (same reel, nothing to do) from a reel change
+  // (stamp is stale). WeakMap so a box Instagram drops is collectible.
+  const stampedBy = new WeakMap();
+  function annotateReelPlayer() {
+    if (!onIgPlayerRoute(location.pathname)) return;
+    for (const v of document.querySelectorAll("video")) {
+      // A grid left mounted behind the post modal is still on /p/<code>/, and its
+      // autoplaying tiles clear the size floor below — so the route is not enough
+      // to say "this is the player". Ask the structure instead, and ask BEFORE the
+      // React-prop walk: this is the expensive part (up to 15 ancestors, a `for..in`
+      // over every prop key of each) and it was running for two dozen tiles every
+      // second to produce stamps that only ever caused phantom rails.
+      if (isIgTileMedia(v)) continue;
+      const r = v.getBoundingClientRect();
+      if (r.width < 200 || r.height < 200) continue;
+      // The rail is hung on the player box, not the <video>: IG replaces the video
+      // element on every reel change, and an attribute on it dies with it.
+      const host = v.closest('div[role="presentation"]') || v.parentElement;
+      if (!host) continue;
+      // …which is exactly why the stamp cannot be written once and left alone. The
+      // box OUTLIVES the media it describes, so on the full-screen player scrolling
+      // to the next reel used to leave the previous reel's id on it — the overlay
+      // then showed the old stats and Download/Save/Transcribe fired on the old
+      // video. Re-resolve whenever the media under this box changed, and drop the
+      // stale stamp first: resolving nothing is recoverable, pointing at the wrong
+      // reel is not.
+      const src = v.currentSrc || v.src || "";
+      const seen = stampedBy.get(host);
+      if (seen && seen.video === v && seen.src === src && host.getAttribute(SW_MEDIA_ATTR))
+        continue;
+      if (seen) {
+        host.removeAttribute(SW_MEDIA_ATTR);
+        host.removeAttribute(SW_MEDIA_ATTR + "-kind");
+      }
+      stampedBy.set(host, { video: v, src });
+      let el = v;
+      for (let i = 0; i < 15 && el; i++) {
+        let key = null;
+        for (const k in el) if (k.startsWith("__reactProps$")) { key = k; break; }
+        if (key) {
+          const props = el[key];
+          const inner = props && props.children && props.children.props;
+          const ref = readReactMediaRef(inner) || readReactMediaRef(props);
+          if (ref) {
+            host.setAttribute(SW_MEDIA_ATTR, ref.value);
+            host.setAttribute(SW_MEDIA_ATTR + "-kind", ref.kind);
+            break;
+          }
+        }
+        el = el.parentElement;
+      }
+    }
+  }
+  // Cheap and idempotent (a box whose media has not changed costs one WeakMap hit
+  // and two identity comparisons), so a plain interval is enough — no second
+  // MutationObserver on a page that mutates constantly.
+  setInterval(annotateReelPlayer, 1000);
+  document.addEventListener("visibilitychange", annotateReelPlayer);
+
+  // The isolated bridge attaches its listener at document_idle — long after we start
+  // capturing. It asks us to replay everything we've buffered (media + reels).
+  window.addEventListener("message", (e) => {
+    if (e.source === window && e.data && e.data.__fbwIgDeep) { readWeek(e.data.__fbwIgDeep); return; }
+    if (e.source === window && e.data && e.data.__fbwIgCollectStart) { collectThread(String(e.data.__fbwIgCollectStart)); return; }
+    if (e.source === window && e.data && e.data.__fbwIgCollectStop) { collectStop = true; if (collectWake) collectWake(); return; }
+    if (e.source === window && e.data && e.data.__fbwIgCollectAsk) { postCollect(); return; }
+    if (e.source === window && e.data && e.data.__fbwIgReq)
+      send([...new Set(all.values()), ...reelAll.values(), ...allIgCom.values(),
+        ...Array.from(users.values(), (user) => ({ __kind: "user", ...user }))]);
+  });
+
+})();

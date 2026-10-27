@@ -1,0 +1,452 @@
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Moon, Sun, X } from "lucide-react";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import useStoredFlag from "@/lib/useStoredFlag";
+import { useSpyPrefs } from "@/lib/useSpy";
+import { IG_SPY_LIMIT, IG_SPY_LIMIT_MAX } from "@/lib/spyStore";
+import {
+  TRANSCRIPT_CAP_KEY,
+  TRANSCRIPT_CAP_OPTIONS,
+  normalizeTranscriptCap,
+  readTranscriptCap,
+  writeTranscriptCap,
+} from "@/lib/transcriptCap";
+import { TX_LANG_OPTIONS } from "@/lib/shared/txLang.js";
+import {
+  TRANSCRIPT_LANGUAGE_KEY,
+  normalizeTranscriptLanguage,
+  readStoredTranscriptLanguage,
+  writeStoredTranscriptLanguage,
+} from "@/lib/transcriptionLanguage";
+import { TX_PENALTY_KEY, TX_PENALTY_VALUES, normalizeTxPenalty, readStoredTxPenalty, writeStoredTxPenalty } from "@/lib/txPenalty";
+import { DL_PREFS_KEY, DEFAULT_DL_PREFS, normalizeDlPrefs, setDownloadPrefs } from "@/lib/downloadPath";
+import { Input } from "@/components/ui/input";
+
+// Opções — one place for every setting that is about the PANEL rather than about
+// a running job. Before this the settings were spread over the surfaces that
+// happened to need them: the theme lived in the header, the page-overlay switches
+// in each Sort tool's toolbar, the transcription language in the Arquivo tab, and
+// Pinterest's overlay had no switch at all — it could only be changed by editing
+// storage. So "where do I turn that off" had a different answer every time.
+//
+// What does NOT belong here: the warmer's gear (ritmo, limites, captura
+// automática). Those configure the session you are about to run, they live in the
+// form that runs it, and they are meaningless while the warmer is hidden.
+//
+// A modal rather than a dropdown: the panel is 260-400px wide, and a dropdown
+// wide enough for three sections would hang off its own edge (the warmer's gear
+// already has to cap its width to the viewport). The modal owns the panel while
+// it is open, which is also what makes it a fine home for settings you visit
+// rarely and then leave alone.
+export default function OptionsModal({ open, onClose, prefs, setPrefs, theme, setTheme }) {
+  const cardRef = useRef(null);
+  const closeRef = useRef(null);
+  const [igOverlay, setIgOverlay] = useStoredFlag("sw_ig_overlay");
+  const [ttOverlay, setTtOverlay] = useStoredFlag("sw_tt_overlay");
+  const [pinOverlay, setPinOverlay] = useStoredFlag("sw_pin_overlay");
+
+  // Escape closes; the listener only exists while the modal does.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  // The close button takes focus on open, so Tab starts inside the dialog and
+  // Enter/Space dismisses it without reaching for the mouse.
+  useEffect(() => {
+    if (open) closeRef.current?.focus();
+  }, [open]);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/45 p-4 backdrop-blur-[2px]"
+      // Only a press that both starts AND ends on the backdrop closes it — a drag
+      // that began on a switch and released outside must not dismiss the dialog.
+      onMouseDown={(e) => {
+        if (!cardRef.current?.contains(e.target)) onClose();
+      }}
+    >
+      <div
+        ref={cardRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Opções"
+        className="sw-pop my-8 w-full max-w-sm rounded-2xl border border-border bg-card text-card-foreground shadow-2xl"
+      >
+        <header className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+          <h2 className="text-sm font-semibold">Opções</h2>
+          <button
+            ref={closeRef}
+            onClick={onClose}
+            title="Fechar"
+            aria-label="Fechar"
+            className="sw-hoverable grid size-7 place-items-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            <X className="size-4" />
+          </button>
+        </header>
+
+        <div className="max-h-[70vh] overflow-y-auto px-4 py-3">
+          <Section title="Painel">
+            <div className="flex items-center justify-between gap-3 py-1.5">
+              <span className="text-sm text-foreground">Tema</span>
+              <Choice
+                value={theme}
+                onChange={setTheme}
+                options={[
+                  { value: "light", label: "Claro", Icon: Sun },
+                  { value: "dark", label: "Escuro", Icon: Moon },
+                ]}
+              />
+            </div>
+          </Section>
+
+          <Section
+            title="Sobreposições nas páginas"
+            hint="Os selos de estatísticas e os botões (salvar, baixar, transcrever) desenhados sobre os posts da própria rede."
+          >
+            <Row
+              id="opt-ovl-ig"
+              label="Instagram"
+              checked={igOverlay}
+              onChange={setIgOverlay}
+            />
+            <Row id="opt-ovl-tt" label="TikTok" checked={ttOverlay} onChange={setTtOverlay} />
+            <Row
+              id="opt-ovl-pin"
+              label="Pinterest"
+              checked={pinOverlay}
+              onChange={setPinOverlay}
+            />
+          </Section>
+
+          <DownloadsSection />
+
+          <ArchiveSection />
+
+          <SpySection />
+
+          <Section
+            title="Transcrição"
+            hint="Idioma das PRÓXIMAS transcrições. As já feitas guardam o idioma com que foram geradas."
+            noBorder
+          >
+            <div className="flex items-center justify-between gap-3 py-1.5">
+              <span className="text-sm text-foreground">Idioma padrão</span>
+              <TxLanguageChoice />
+            </div>
+            <TxPenaltySetting />
+          </Section>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function Section({ title, hint, children, noBorder }) {
+  return (
+    <section className={noBorder ? "py-3" : "border-b border-border py-3"}>
+      <h3 className="text-[11px] font-bold uppercase tracking-[0.08em] text-fg/45">
+        {title}
+      </h3>
+      {hint && <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{hint}</p>}
+      <div className="mt-2 space-y-1">{children}</div>
+    </section>
+  );
+}
+
+function Row({ id, label, hint, checked, onChange }) {
+  return (
+    <div className="py-0.5">
+      <div className="flex items-center justify-between gap-3">
+        <Label htmlFor={id} className="min-w-0 cursor-pointer text-sm text-foreground">
+          {label}
+        </Label>
+        <Switch id={id} className="shrink-0" checked={checked} onCheckedChange={onChange} />
+      </div>
+      {hint && <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+// A whole number typed and saved on blur/Enter; the owner's value is clamped by
+// `save`'s caller and shown back as stored.
+export function NumberRow({ id, label, hint, value, min, max, onSave }) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => { setDraft(String(value)); }, [value]);
+  const commit = () => {
+    const n = Math.round(Number(draft));
+    if (!Number.isFinite(n) || n < min) { setDraft(String(value)); return; }
+    if (Math.min(n, max) !== value) onSave(Math.min(n, max));
+    else setDraft(String(value));
+  };
+  // Escape or a click outside closes the modal with no blur: keep what was typed.
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
+  useEffect(() => () => commitRef.current(), []);
+  return (
+    <div className="py-0.5">
+      <div className="flex items-center justify-between gap-3">
+        <Label htmlFor={id} className="min-w-0 text-sm text-foreground">{label}</Label>
+        <input
+          id={id}
+          type="number"
+          inputMode="numeric"
+          min={min}
+          max={max}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+          className="w-16 shrink-0 rounded-lg border border-border bg-background px-2 py-1 text-right text-sm tabular-nums text-foreground outline-none focus:border-primary"
+        />
+      </div>
+      {hint && <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+// Small segmented picker for the settings that are a choice, not a switch.
+function Choice({ value, onChange, options }) {
+  return (
+    <div className="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5">
+      {options.map(({ value: v, label, Icon }) => (
+        <button
+          key={v}
+          onClick={() => onChange(v)}
+          aria-pressed={value === v}
+          title={label}
+          className={
+            value === v
+              ? "flex items-center gap-1 rounded-[4px] bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground"
+              : "flex items-center gap-1 rounded-[4px] px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground hover:text-foreground"
+          }
+        >
+          {Icon && <Icon className="size-3" />}
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// The same stored key the Arquivo tab and the on-page Transcrever menus write,
+// so a change here IS a change there (and vice versa, while this is open).
+function TxLanguageChoice() {
+  const [lang, setLang] = useState(null);
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome?.storage?.local) return;
+    readStoredTranscriptLanguage().then(setLang).catch(() => {});
+    const onCh = (c, area) => {
+      if (area === "local" && c[TRANSCRIPT_LANGUAGE_KEY])
+        setLang(normalizeTranscriptLanguage(c[TRANSCRIPT_LANGUAGE_KEY].newValue));
+    };
+    chrome.storage.onChanged?.addListener(onCh);
+    return () => chrome.storage.onChanged?.removeListener(onCh);
+  }, []);
+  if (lang === null) return null;
+  return (
+    <Choice
+      value={lang}
+      onChange={(v) => writeStoredTranscriptLanguage(v).then(setLang)}
+      options={TX_LANG_OPTIONS.map((o) => ({ value: o.value, label: o.short }))}
+    />
+  );
+}
+
+// Whisper's repetition penalty (lib/txPenalty.js). Read by the background at the
+// start of each job, so a change applies from the next transcription on; the
+// value used is filed on the transcript and shown in the acervo's record details.
+function TxPenaltySetting() {
+  const [setting, setSetting] = useState(null);
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome?.storage?.local) return;
+    readStoredTxPenalty().then(setSetting).catch(() => {});
+    const onCh = (c, area) => {
+      if (area === "local" && c[TX_PENALTY_KEY]) setSetting(normalizeTxPenalty(c[TX_PENALTY_KEY].newValue));
+    };
+    chrome.storage.onChanged?.addListener(onCh);
+    return () => chrome.storage.onChanged?.removeListener(onCh);
+  }, []);
+  if (setting === null) return null;
+  const update = (patch) => writeStoredTxPenalty(patch).then(setSetting);
+  return (
+    <>
+      <Row
+        id="opt-tx-penalty"
+        label="Penalidade de repetição"
+        hint="Evita que o Whisper entre em loop em silêncio ou música, mas o faz pular palavras que se repetem de verdade. Num teste, 1.1 errou 28 de 180 palavras e cortou o fim; desligada, nenhuma."
+        checked={setting.enabled}
+        onChange={(v) => update({ enabled: v })}
+      />
+      {setting.enabled && (
+        <div className="flex items-center justify-between gap-3 py-1.5">
+          <span className="text-sm text-foreground">Intensidade</span>
+          <Choice
+            value={setting.value}
+            onChange={(v) => update({ value: v })}
+            options={TX_PENALTY_VALUES.map((v) => ({ value: v, label: String(v) }))}
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---- Spy ----
+// The daily pass and the Instagram budget. Readings stay in this browser.
+function SpySection() {
+  const [spyDaily, saveSpyDaily, spyIgLimit, saveSpyIgLimit] = useSpyPrefs();
+  const [error, setError] = useState(null);
+  const failed = () => setError("Não consegui salvar essa opção.");
+  return (
+    <Section title="Spy" hint="Perfis salvos na área Spy. As leituras ficam só neste navegador.">
+      <Row
+        id="opt-spy-daily"
+        label="Atualizar perfis salvos uma vez por dia"
+        hint="A extensão consulta cada perfil salvo no Instagram e no Facebook uma vez por dia, usando a sua sessão. Desligada, o “Medir agora” da área Spy continua funcionando."
+        checked={spyDaily}
+        onChange={(v) => saveSpyDaily(v).catch(failed)}
+      />
+      <NumberRow
+        id="opt-spy-ig-limit"
+        label="Leituras do Instagram por dia"
+        hint={`Cada leitura abre a página de um perfil numa aba em segundo plano, uma a cada 20–40 s, e vale para a passada diária e o “Medir agora”. O Instagram não publica um limite: mais leituras aumentam o risco de verificação ou bloqueio temporário da conta. Padrão ${IG_SPY_LIMIT}, máximo ${IG_SPY_LIMIT_MAX}.`}
+        value={spyIgLimit}
+        min={1}
+        max={IG_SPY_LIMIT_MAX}
+        onSave={(v) => saveSpyIgLimit(v).catch(failed)}
+      />
+      {error && <p className="text-[11px] text-destructive">{error}</p>}
+    </Section>
+  );
+}
+
+
+// ---- Arquivo ----
+// How many transcriptions to keep. It used to be 20, hard-coded, and the number
+// was never the point: the store is one object re-serialized on every write,
+// with a thumbnail inside every record, so the cap is what keeps a write cheap.
+// Whose ceiling that should be is the user's call — so it is a setting, with the
+// cost of "sem limite" stated instead of discovered.
+// Where files land, and how many folders they land in.
+//
+// CHROME'S LIMIT, stated in the UI because it is not guessable: a download's path
+// is always RELATIVE to the browser's own download directory. An extension cannot
+// write to "/Users/…/Videos" — Chrome rejects an absolute path outright. So an
+// empty field means the download directory itself, and moving that is a browser
+// setting (chrome://settings/downloads).
+function DownloadsSection() {
+  const [prefs, setPrefsState] = useState(DEFAULT_DL_PREFS);
+  // The field is a free-text path, so it is edited as a STRING and only
+  // normalized on commit — normalizing per keystroke eats the "/" the moment you
+  // type it, and you can never reach "pesquisa/instagram".
+  const [draft, setDraft] = useState(DEFAULT_DL_PREFS.folder);
+
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome?.storage?.local) return;
+    chrome.storage.local.get(DL_PREFS_KEY, (r) => {
+      const next = normalizeDlPrefs(r && r[DL_PREFS_KEY]);
+      setPrefsState(next);
+      setDraft(next.folder);
+    });
+  }, []);
+
+  const save = (patch) => {
+    const next = normalizeDlPrefs({ ...prefs, ...patch });
+    setPrefsState(next);
+    setDraft(next.folder);
+    // Write the cache in THIS context too: storage.onChanged does not fire for
+    // the page that wrote it in every Chrome version, and the panel builds its
+    // own spreadsheet/transcript/ZIP paths.
+    setDownloadPrefs(next);
+    chrome.storage?.local?.set?.({ [DL_PREFS_KEY]: next });
+  };
+
+  const shown = prefs.folder || "a pasta de downloads do navegador";
+  const example = [prefs.folder, !prefs.folder || prefs.flat ? null : "videos", "creator_beta7-ig-DaBFBcgxZIi.mp4"]
+    .filter(Boolean)
+    .join("/");
+
+  return (
+    <Section
+      title="Downloads"
+      hint="Pasta dentro da pasta de downloads do navegador. Para mudar o disco, use chrome://settings/downloads — uma extensão não pode gravar fora dela."
+    >
+      <div className="py-1">
+        <Label htmlFor="dl-folder" className="text-sm text-foreground">
+          Pasta
+        </Label>
+        <Input
+          id="dl-folder"
+          value={draft}
+          placeholder="vazio = direto na pasta de downloads"
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => save({ folder: draft })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+          }}
+          className="mt-1 h-8 text-sm"
+        />
+      </div>
+      {prefs.folder ? <Row
+        id="dl-flat"
+        label="Tudo numa pasta só"
+        hint="Sem videos/ imagens/ dados/ — vídeos, capas, planilhas e transcrições ficam juntos. Cada arquivo já começa com o @ do perfil, então a ordem alfabética agrupa por criador."
+        checked={prefs.flat}
+        onChange={(v) => save({ flat: v })}
+      /> : <p className="py-1 text-xs text-muted-foreground">
+        Pasta vazia: todos os arquivos vão direto para Downloads, sem subpastas.
+      </p>}
+      <p className="mt-1 break-all text-[11px] leading-relaxed text-muted-foreground">
+        Salvando em <span className="font-medium text-foreground">{shown}</span>
+        <br />
+        Exemplo: <span className="font-medium text-foreground">{example}</span>
+      </p>
+    </Section>
+  );
+}
+
+const ARCHIVE_HINT = "Quantas transcrições ficam guardadas aqui. As mais antigas saem primeiro quando o limite é atingido.";
+function ArchiveSection() {
+  const [cap, setCap] = useState(null);
+
+  useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome?.storage?.local) return;
+    readTranscriptCap().then(setCap).catch(() => {});
+    const onCh = (c, area) => {
+      if (area === "local" && c[TRANSCRIPT_CAP_KEY]) setCap(normalizeTranscriptCap(c[TRANSCRIPT_CAP_KEY].newValue));
+    };
+    chrome.storage.onChanged?.addListener(onCh);
+    return () => chrome.storage.onChanged?.removeListener(onCh);
+  }, []);
+
+  if (cap === null) return null;
+  const current = TRANSCRIPT_CAP_OPTIONS.find((o) => o.value === cap);
+
+  return (
+    <Section
+      title="Arquivo"
+      hint={ARCHIVE_HINT}
+    >
+      <div className="flex items-center justify-between gap-3 py-1.5">
+        <span className="text-sm text-foreground">Máximo de transcrições</span>
+        <Choice
+          value={cap}
+          onChange={(v) => writeTranscriptCap(v).then(() => setCap(normalizeTranscriptCap(v)))}
+          options={TRANSCRIPT_CAP_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+        />
+      </div>
+      {current?.hint && <p className="text-[11px] leading-relaxed text-muted-foreground">{current.hint}</p>}
+    </Section>
+  );
+}

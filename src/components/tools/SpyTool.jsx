@@ -1,0 +1,252 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Activity, ChevronDown, CloudUpload, ExternalLink, Loader2, RotateCw, Trash2 } from "lucide-react";
+import { useSpy } from "@/lib/useSpy";
+import { dayKey, measureDayKey, measuredAt } from "@/lib/spyStore";
+import { activityNow, profileStatus, reelsLine, syncStatus } from "@/lib/spyStatus";
+import { clockText } from "@/lib/spyActivity";
+import { parseProfileUrl, profileUrl, spyId } from "@/lib/spyProfile";
+import { PLATFORMS } from "@/lib/platforms";
+
+const TONE = {
+  ok: "text-good",
+  warn: "text-amber-600 dark:text-amber-400",
+  error: "text-destructive",
+  info: "text-muted-foreground",
+};
+function SourceIcon({ platform }) {
+  const Glyph = PLATFORMS[platform]?.Glyph;
+  if (Glyph) return <Glyph className="size-3 shrink-0" aria-label={PLATFORMS[platform].name} />;
+  return <Activity className="size-3 shrink-0" aria-hidden="true" />;
+}
+
+// The saved list shows its first profiles and a peek of the next one under a
+// fade; "Mostrar todos" opens the rest with a height transition. A list only one
+// or two longer than that is shown whole.
+const COLLAPSED_COUNT = 5;
+const PEEK_PX = 34;
+function CollapsibleList({ count, children }) {
+  const listRef = useRef(null);
+  const [expanded, setExpanded] = useState(false);
+  const [heights, setHeights] = useState({ collapsed: null, full: null });
+  const collapsible = count > COLLAPSED_COUNT + 1;
+  useLayoutEffect(() => {
+    const ul = listRef.current;
+    if (!ul || !collapsible) return undefined;
+    const measure = () => {
+      const last = ul.children[COLLAPSED_COUNT - 1];
+      setHeights({ collapsed: last ? last.offsetTop + last.offsetHeight + PEEK_PX : null, full: ul.scrollHeight });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(measure);
+    for (const child of ul.children) ro.observe(child);
+    return () => ro.disconnect();
+  }, [count, collapsible]);
+  const maxHeight = !collapsible || heights.collapsed == null ? undefined : expanded ? heights.full : heights.collapsed;
+  return (
+    <div className="space-y-1.5">
+      <div className="relative overflow-hidden rounded-xl border border-border bg-card motion-safe:transition-[max-height] motion-safe:duration-500 motion-safe:ease-[cubic-bezier(0.22,1,0.36,1)]"
+        style={maxHeight != null ? { maxHeight } : undefined}>
+        <ul ref={listRef} className="divide-y divide-border">{children}</ul>
+        {collapsible && (
+          <div aria-hidden="true"
+            className={`pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-card via-card/80 to-transparent motion-safe:transition-opacity motion-safe:duration-300 ${expanded ? "opacity-0" : "opacity-100"}`} />
+        )}
+      </div>
+      {collapsible && (
+        <button type="button" onClick={() => setExpanded((v) => !v)} aria-expanded={expanded}
+          className="sw-hoverable mx-auto flex items-center gap-1 rounded-full px-3 py-1 text-[11px] text-muted-foreground hover:text-foreground">
+          {expanded ? "Mostrar menos" : `Mostrar todos (${count})`}
+          <ChevronDown className={`size-3.5 motion-safe:transition-transform motion-safe:duration-300 ${expanded ? "rotate-180" : ""}`} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+const buttonClass = "sw-hoverable rounded-lg border border-border px-2 py-1.5 text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-50";
+function RemoveButton({ id, remove, disabled = false }) {
+  const [confirm, setConfirm] = useState(false);
+  useEffect(() => {
+    setConfirm(false);
+  }, [id]);
+  useEffect(() => {
+    if (!confirm) return;
+    const timer = setTimeout(() => setConfirm(false), 4000);
+    return () => clearTimeout(timer);
+  }, [confirm]);
+  return (
+    <button type="button" disabled={disabled} className={buttonClass}
+      aria-label={confirm ? "Confirmar remoção" : "Remover perfil"}
+      onClick={() => { if (confirm) { setConfirm(false); remove(id); } else setConfirm(true); }}>
+      {confirm ? "confirmar remoção" : <Trash2 className="size-3.5" />}
+    </button>
+  );
+}
+
+export default function SpyTool({ activeUrl = "" }) {
+  const { profiles, state, queue, activity, hub, nextTickAt, dailyOff, igLimit, configured, ready, error: loadError, save, remove, measureProfile, runPass } = useSpy();
+  const [busy, setBusy] = useState(null);
+  const [runningPass, setRunningPass] = useState(false);
+  const [error, setError] = useState(null);
+  const [now, setNow] = useState(Date.now);
+  const live = activityNow(state, profiles, { now, nextTickAt, dailyOff });
+  // Countdowns tick every second while something runs.
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), live.busy ? 1000 : 30000);
+    return () => clearInterval(timer);
+  }, [live.busy]);
+  const active = parseProfileUrl(activeUrl);
+  const activeId = active ? spyId(active.platform, active.key) : null;
+  const saved = profiles.find((p) => p.id === activeId);
+  const run = async (id, action) => {
+    setBusy(id); setError(null);
+    try { await action(); }
+    catch (e) {
+      setError(e.message === "limit_reached" ? "Limite de 100 perfis. Remova um para salvar outro." : "Não consegui salvar a alteração. Tente de novo.");
+    } finally { setBusy(null); }
+  };
+  const removeProfile = (id) => run(id, () => remove(id));
+  const measureOne = (id) => run(id, () => measureProfile(id));
+  const measured = profiles.filter((p) => measuredAt(state, p) != null && measureDayKey(measuredAt(state, p)) === measureDayKey(now)).length;
+  const igReads = state.igDaily?.day === dayKey(now) ? state.igDaily.count || 0 : 0;
+  const sync = syncStatus(queue, state, hub, now);
+  const passRunning = !!(state.igBatch || state.fbManual?.length);
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-xl border border-border bg-card p-3 space-y-2.5" aria-label="Perfil da aba ativa">
+        <h2 className="text-[11px] font-bold uppercase tracking-[0.08em] text-fg/45">Perfil da aba ativa</h2>
+        {active ? <>
+          <p className="break-words text-sm font-medium">
+            {saved?.name || (/^\d+$/.test(active.key) ? `Perfil ${active.key}` : `@${active.key}`)}
+            <span className="text-muted-foreground font-normal"> · {PLATFORMS[active.platform].name}</span>
+          </p>
+          {saved ? <RemoveButton key={activeId} id={activeId} remove={removeProfile} disabled={busy != null} /> :
+            <button type="button" className={buttonClass} disabled={!configured || busy != null}
+              onClick={() => run(activeId, () => save(active.platform, active.key))}>
+              {busy === activeId ? "salvando…" : "Salvar perfil"}
+            </button>}
+        </> : <p className="text-xs leading-relaxed text-muted-foreground">Abra um perfil do Instagram ou do Facebook para salvá-lo.</p>}
+      </section>
+
+      {(error || (configured && loadError)) && <p role="alert" className="text-xs text-destructive">{error || loadError}</p>}
+      {configured && profiles.length > 0 && <section className="rounded-xl border border-border bg-card p-3 space-y-2.5" aria-label="Medição">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-[11px] font-bold uppercase tracking-[0.08em] text-fg/45">Medição</h2>
+          <button
+            type="button"
+            disabled={runningPass || passRunning}
+            className={buttonClass}
+            onClick={async () => {
+              setRunningPass(true); setError(null);
+              try {
+                await runPass();
+              } catch {
+                setError("Não consegui iniciar a medição. Veja o histórico abaixo.");
+              } finally {
+                setRunningPass(false);
+              }
+            }}
+            title={passRunning ? "Já há uma medição em andamento" : "Medir todos os perfis agora"}
+          >
+            {runningPass ? "iniciando…" : passRunning ? "medindo…" : "Medir agora"}
+          </button>
+        </div>
+        <ul className="space-y-1.5 text-[11px] leading-relaxed" aria-live="polite">
+          {live.lines.map((line, i) => (
+            <li key={`${line.platform}-${i}`} className={`flex gap-1.5 ${line.spinning ? "font-medium text-primary" : TONE[line.tone]}`}>
+              <span className="mt-[3px]">{line.spinning ? <Loader2 className="size-3 animate-spin shrink-0" /> : <SourceIcon platform={line.platform} />}</span>
+              <span className="min-w-0">
+                {line.text}
+                {line.detail && <span className="block text-muted-foreground font-normal">{line.detail}</span>}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <div className="space-y-0.5 border-t border-border pt-2 text-[11px] leading-relaxed text-muted-foreground">
+          <p>Hoje: {measured} de {profiles.length} medidos · Instagram: {igReads} de {igLimit} leituras do dia</p>
+          <p>As medições ficam só neste navegador.</p>
+        </div>
+      </section>}
+      <section aria-label="Perfis salvos" className="space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-[11px] font-bold uppercase tracking-[0.08em] text-fg/45">Perfis salvos</h2>
+          {/* The numbers, charts and top posts live on the dashboard page (src/dashboard/). */}
+          <button
+            type="button"
+            onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL("dashboard.html") })}
+            className="sw-hoverable inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            <ExternalLink className="size-3" aria-hidden="true" /> Abrir painel
+          </button>
+        </div>
+        {!ready ? <p className="text-xs text-muted-foreground">Carregando perfis…</p> : !profiles.length ?
+          <p className="text-xs text-muted-foreground">Nenhum perfil salvo.</p> :
+          <CollapsibleList count={profiles.length}>
+            {profiles.map((p) => {
+              const isNumeric = /^\d+$/.test(p.key);
+              const displayName = p.name || (isNumeric ? `Perfil ${p.key}` : `@${p.key}`);
+              const subtitle = p.name
+                ? `${PLATFORMS[p.platform]?.name || p.platform}${!isNumeric ? ` · @${p.key}` : ""}`
+                : (PLATFORMS[p.platform]?.name || p.platform);
+              return (
+                <li key={p.id} className="flex flex-wrap items-center gap-2 p-3">
+                  <div className="min-w-0 basis-24 grow">
+                    <p className="truncate text-sm font-medium" title={displayName}>{displayName}</p>
+                    <p className="text-[11px] text-muted-foreground">{subtitle}</p>
+                    {(() => {
+                      const status = profileStatus(p, { state, queue, now, igLimit });
+                      const tone = status.kind === "measuring" ? "font-medium text-primary"
+                        : status.kind === "failed" || status.kind === "paused" ? "text-amber-600 dark:text-amber-400"
+                        : "text-muted-foreground";
+                      return (
+                        <p className={`text-[11px] flex items-center gap-1 ${tone}`}>
+                          {status.kind === "measuring" && <Loader2 className="size-3 animate-spin shrink-0" />}
+                          {status.kind === "pending" && <span className="inline-block size-1.5 rounded-full bg-primary/70 animate-pulse" />}
+                          {status.text}
+                        </p>
+                      );
+                    })()}
+                    {reelsLine(p, state) && <p className="text-[11px] text-muted-foreground">{reelsLine(p, state)}</p>}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {p.platform === "facebook" && <button
+                      type="button"
+                      disabled={busy != null || !!state.measuring}
+                      className={buttonClass}
+                      onClick={() => measureOne(p.id)}
+                      title="Medir este perfil agora"
+                      aria-label={p.name ? `Medir ${p.name}` : `Medir perfil @${p.key}`}
+                    >
+                      <RotateCw className={`size-3.5 ${busy === p.id || state.measuring?.id === p.id ? "animate-spin" : ""}`} />
+                    </button>}
+                    <a href={profileUrl(p.platform, p.key)} target="_blank" rel="noreferrer" className={buttonClass}
+                      title={p.platform === "instagram" ? "Abrir perfil para medir pela captura passiva" : "Abrir perfil"}
+                      aria-label={`Abrir ${p.name || `perfil @${p.key}`}${p.platform === "instagram" ? " para medir" : ""}`}><ExternalLink className="size-3.5" /></a>
+                    <RemoveButton id={p.id} remove={removeProfile} disabled={busy != null} />
+                  </div>
+                </li>
+              );
+            })}
+          </CollapsibleList>}
+      </section>
+      {!configured ? <p className="text-[11px] text-muted-foreground">
+      </p>
+        : activity.length > 0 && <section aria-label="Histórico" className="space-y-2">
+          <h2 className="text-[11px] font-bold uppercase tracking-[0.08em] text-fg/45">Histórico</h2>
+          <ol className="max-h-64 overflow-y-auto divide-y divide-border rounded-xl border border-border bg-card text-[11px] leading-relaxed">
+            {[...activity].reverse().map((entry, i) => (
+              <li key={`${entry.at}-${i}`} className={`flex gap-1.5 px-3 py-1.5 ${TONE[entry.tone] || TONE.info}`}>
+                <time className="shrink-0 tabular-nums text-muted-foreground" dateTime={new Date(entry.at).toISOString()}>
+                  {dayKey(entry.at) === dayKey(now) ? clockText(entry.at, true) : `${new Date(entry.at).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })} ${clockText(entry.at)}`}
+                </time>
+                <span className="mt-[3px]"><SourceIcon platform={entry.platform} /></span>
+                <span className="min-w-0 break-words">{entry.text}</span>
+              </li>
+            ))}
+          </ol>
+        </section>}
+    </div>
+  );
+}

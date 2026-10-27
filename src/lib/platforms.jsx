@@ -1,0 +1,122 @@
+import { Film, Newspaper, Search } from "lucide-react";
+
+// Brand marks (simple-icons paths). lucide lacks TikTok and uses a different
+// visual language, so all three platform logos use brand SVGs for a consistent
+// gradient-glow treatment. 24x24 viewBox, single path, currentColor fill.
+export function FacebookGlyph(props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M9.101 23.691v-7.98H6.627v-3.667h2.474v-1.58c0-4.085 1.848-5.978 5.858-5.978.401 0 .955.042 1.468.103a8.68 8.68 0 0 1 1.141.195v3.325a8.623 8.623 0 0 0-.653-.036 26.805 26.805 0 0 0-.733-.009c-.707 0-1.259.096-1.675.309a1.686 1.686 0 0 0-.679.622c-.258.42-.374.995-.374 1.752v1.297h3.919l-.386 2.103-.287 1.564h-3.246v8.245C19.396 23.238 24 18.179 24 12.044c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.628 3.874 10.35 9.101 11.647Z" />
+    </svg>
+  );
+}
+
+export function InstagramGlyph(props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M12 0C8.74 0 8.333.015 7.053.072 5.775.132 4.905.333 4.14.63c-.789.306-1.459.717-2.126 1.384S.935 3.35.63 4.14C.333 4.905.131 5.775.072 7.053.012 8.333 0 8.74 0 12s.015 3.667.072 4.947c.06 1.277.261 2.148.558 2.913.306.788.717 1.459 1.384 2.126.667.666 1.336 1.079 2.126 1.384.766.296 1.636.499 2.913.558C8.333 23.988 8.74 24 12 24s3.667-.015 4.947-.072c1.277-.06 2.148-.262 2.913-.558.788-.306 1.459-.718 2.126-1.384.666-.667 1.079-1.335 1.384-2.126.296-.765.499-1.636.558-2.913.06-1.28.072-1.687.072-4.947s-.015-3.667-.072-4.947c-.06-1.277-.262-2.149-.558-2.913-.306-.789-.718-1.459-1.384-2.126C21.319 1.347 20.651.935 19.86.63c-.765-.297-1.636-.499-2.913-.558C15.667.012 15.26 0 12 0Zm0 2.16c3.203 0 3.585.016 4.85.071 1.17.055 1.805.249 2.227.415.562.217.96.477 1.382.896.419.42.679.819.896 1.381.164.422.36 1.057.413 2.227.057 1.266.07 1.646.07 4.85s-.015 3.585-.074 4.85c-.061 1.17-.256 1.805-.421 2.227a3.81 3.81 0 0 1-.899 1.382 3.744 3.744 0 0 1-1.38.896c-.42.164-1.065.36-2.235.413-1.274.057-1.649.07-4.859.07-3.211 0-3.586-.015-4.859-.074-1.171-.061-1.816-.256-2.236-.421-.569-.219-.96-.474-1.379-.899-.421-.419-.69-.824-.9-1.38-.165-.42-.359-1.065-.42-2.235-.045-1.26-.061-1.649-.061-4.844 0-3.196.016-3.586.061-4.861.061-1.17.255-1.814.42-2.234.21-.57.479-.96.9-1.381.419-.419.81-.689 1.379-.898.42-.166 1.051-.361 2.221-.421 1.275-.045 1.65-.06 4.859-.06l.045.03Zm0 3.678a6.162 6.162 0 1 0 0 12.324 6.162 6.162 0 0 0 0-12.324ZM12 16a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm7.846-10.405a1.441 1.441 0 0 1-2.88 0 1.44 1.44 0 0 1 2.88 0Z" />
+    </svg>
+  );
+}
+
+export function TikTokGlyph(props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.07-.14 1.61.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z" />
+    </svg>
+  );
+}
+
+export function PinterestGlyph(props) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M12.017 0C5.396 0 .029 5.367.029 11.987c0 5.079 3.158 9.417 7.618 11.162-.105-.949-.199-2.403.041-3.439.219-.937 1.406-5.957 1.406-5.957s-.359-.72-.359-1.781c0-1.663.967-2.911 2.168-2.911 1.024 0 1.518.769 1.518 1.688 0 1.029-.653 2.567-.992 3.992-.285 1.193.6 2.165 1.775 2.165 2.128 0 3.768-2.245 3.768-5.487 0-2.861-2.063-4.869-5.008-4.869-3.41 0-5.409 2.562-5.409 5.199 0 1.033.394 2.143.889 2.741.099.12.112.225.085.345-.09.375-.293 1.199-.334 1.363-.053.225-.172.271-.401.165-1.495-.69-2.433-2.878-2.433-4.646 0-3.776 2.748-7.252 7.92-7.252 4.158 0 7.392 2.967 7.392 6.923 0 4.135-2.607 7.462-6.233 7.462-1.214 0-2.354-.629-2.758-1.379l-.749 2.848c-.269 1.045-1.004 2.352-1.498 3.146 1.123.345 2.306.535 3.55.535 6.607 0 11.985-5.365 11.985-11.987C23.97 5.367 18.592.001 11.985.001L12.017 0z" />
+    </svg>
+  );
+}
+
+// Mode catalog (shared ids; engine routes by platform+mode).
+//   C = reels / for-you video    B = feed / explore    A = keyword / hashtag / search
+const MODE = {
+  C: { id: "C", label: "Reels", Icon: Film },
+  B: { id: "B", label: "Feed", Icon: Newspaper },
+  A: { id: "A", label: "Palavra-chave", Icon: Search },
+};
+
+// A semente de cor de cada rede: UM hex, o matiz da marca.
+//
+// Era um gradiente por rede aqui. A linguagem para onde o painel migrou
+// (apps/gestao) não tem gradiente nenhum — tem acentos chapados — então o hex
+// entra na fórmula de acento do index.css (`[data-sw-seed]`), que fica com o
+// MATIZ da marca e toma a luminância e o croma do TEMA. É o que faz o vermelho
+// do Pinterest e o magenta do Instagram continuarem legíveis no claro e no
+// escuro sem ninguém escolher duas cores para cada rede.
+//
+// Nada aqui é aplicado ao <html>: a identidade do painel é uma só (o `sky` do
+// Nord); a semente só tinge o ponto/realce da rede que está selecionada.
+const SEEDS = {
+  facebook: "#1877f2",
+  instagram: "#dd2a7b",
+  tiktok: "#fe2c55",
+  pinterest: "#e60023",
+};
+
+/** Props para tingir um nó com o acento da rede — `style` + o atributo que a
+ *  regra `[data-sw-seed]` procura. */
+export function platformAccent(id) {
+  const seed = SEEDS[id];
+  return seed ? { "data-sw-seed": "", style: { "--sw-seed": seed } } : {};
+}
+
+// Per-platform support. `modes` order = tab order. `defaultMode` selected on switch.
+// `keywordPlaceholder` tunes the Mode A input copy per platform.
+export const PLATFORMS = {
+  facebook: {
+    id: "facebook",
+    name: "Facebook",
+    Glyph: FacebookGlyph,
+    // FB warmer: Reels (watch-full + random like, localized selectors) and
+    // Hashtag (scroll the tag feed and like posts). Feed tab still removed.
+    defaultMode: "C",
+    modes: [MODE.C, { ...MODE.A, label: "Hashtag" }],
+    keywordPlaceholder: "ex.: tarotreading",
+    seed: SEEDS.facebook,
+  },
+  instagram: {
+    id: "instagram",
+    name: "Instagram",
+    Glyph: InstagramGlyph,
+    defaultMode: "C",
+    modes: [
+      MODE.C,
+      { ...MODE.B, label: "Explorar" },
+      { ...MODE.A, label: "Hashtag" },
+    ],
+    keywordPlaceholder: "ex.: tarot  ou  #tarotreading",
+    seed: SEEDS.instagram,
+  },
+  tiktok: {
+    id: "tiktok",
+    name: "TikTok",
+    Glyph: TikTokGlyph,
+    defaultMode: "C",
+    modes: [
+      { ...MODE.C, label: "Para Você" },
+      { ...MODE.A, label: "Pesquisa" },
+    ],
+    keywordPlaceholder: "ex.: tarot  ou  #tarottok",
+    seed: SEEDS.tiktok,
+  },
+  pinterest: {
+    id: "pinterest",
+    name: "Pinterest",
+    Glyph: PinterestGlyph,
+    // Download-only platform: no Warm engine adapter, so no modes.
+    defaultMode: null,
+    modes: [],
+    keywordPlaceholder: "ex.: tiragem de tarot",
+    seed: SEEDS.pinterest,
+  },
+};
+
+export const PLATFORM_ORDER = ["facebook", "instagram", "tiktok", "pinterest"];
