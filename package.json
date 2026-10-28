@@ -1,7 +1,7 @@
 {
   "name": "social-mate",
   "private": true,
-  "version": "1.19.0",
+  "version": "1.19.1",
   "type": "module",
   "description": "Pesquisa de Facebook / Instagram / TikTok / Pinterest num painel lateral do Chrome — tudo local, sem servidor.",
   "scripts": {

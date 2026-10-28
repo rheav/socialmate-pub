@@ -9,7 +9,7 @@ const manifest = {
   manifest_version: 3,
   name: NAME,
   short_name: NAME,
-  version: "1.19.0",
+  version: "1.19.1",
   icons: ICONS,
   action: {
     default_title: `${NAME} (abrir painel lateral)`,
