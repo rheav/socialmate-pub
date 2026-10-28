@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronRight, Eye, Flame, Library as LibraryIcon, Search as SearchIcon, Settings } from "lucide-react";
+import { ChevronRight, Eye, Flame, LayoutDashboard, Library as LibraryIcon, Radar, Search as SearchIcon, Settings } from "lucide-react";
 import { PLATFORMS, PLATFORM_ORDER, platformAccent } from "@/lib/platforms";
 import { workspaceToolsForPlatform, getTool } from "@/lib/tools";
 import { detectActivePlatform, hasChromeTabs } from "@/lib/tabs";
@@ -23,6 +23,7 @@ import SpyTool from "@/components/tools/SpyTool";
 import LibraryTool from "@/components/tools/LibraryTool";
 
 const THEME_KEY = "sw_theme";
+const APP_NAME = "socialRadar";
 
 // NOTE: do NOT retint the UI per platform. The panel keeps ONE identity — the
 // Nord `sky` — on every platform; see index.css :root/.dark. A platform's own
@@ -235,25 +236,30 @@ export default function Shell() {
               setTab("research");
               setPlatform(null);
             }}
-            title="Início — socialMate"
-            aria-label="Início — socialMate"
+            title={`Início — ${APP_NAME}`}
+            aria-label={`Início — ${APP_NAME}`}
             className="flex min-w-0 shrink-0 items-center gap-2.5"
           >
             <div className="grid size-7 shrink-0 place-items-center rounded-[9px] bg-primary">
-              <Flame
-                className="size-[15px] text-primary-foreground"
-                fill="currentColor"
-                strokeWidth={1.5}
-              />
+              <Radar className="size-[16px] text-primary-foreground" strokeWidth={2.25} />
             </div>
             <h1 className="truncate text-[15px] font-semibold tracking-tight text-fg/90 @max-[308px]/toolbar:hidden">
-              socialMate
+              {APP_NAME}
             </h1>
           </button>
           {/* always-visible platform nav — also shows which platform the panel follows */}
           <PlatformSwitcher value={platform} onValueChange={pickPlatform} />
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
+          {/* The Spy dashboard is a page of its own (dashboard.html): the header is where it gets seen. */}
+          <button
+            onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL("dashboard.html") })}
+            title="Abrir o painel do Spy numa aba"
+            className="sw-hoverable flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-primary px-2.5 text-xs font-semibold text-primary-foreground shadow-sm hover:opacity-90"
+          >
+            <LayoutDashboard className="size-4" aria-hidden="true" />
+            <span className="@max-[340px]/toolbar:sr-only">Painel</span>
+          </button>
           {/* One button, not two: the theme moved into Opções with the rest of the
               panel's settings, so the header keeps only the way in. */}
           <button

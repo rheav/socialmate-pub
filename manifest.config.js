@@ -1,26 +1,19 @@
 import { defineManifest } from "@crxjs/vite-plugin";
 
 const PUBLIC = true;
+// The public build has its own name and mark (public/icon-public.svg).
+const NAME = PUBLIC ? "socialRadar" : "socialMate";
+const ICONS = Object.fromEntries([16, 32, 48, 128].map((s) => [s, `${PUBLIC ? "icons-public" : "icons"}/icon-${s}.png`]));
 
 const manifest = {
   manifest_version: 3,
-  name: "socialMate",
-  short_name: "socialMate",
-  version: "1.18.0",
-  icons: {
-    16: "icons/icon-16.png",
-    32: "icons/icon-32.png",
-    48: "icons/icon-48.png",
-    128: "icons/icon-128.png",
-  },
+  name: NAME,
+  short_name: NAME,
+  version: "1.19.0",
+  icons: ICONS,
   action: {
-    default_title: "socialMate (abrir painel lateral)",
-    default_icon: {
-      16: "icons/icon-16.png",
-      32: "icons/icon-32.png",
-      48: "icons/icon-48.png",
-      128: "icons/icon-128.png",
-    },
+    default_title: `${NAME} (abrir painel lateral)`,
+    default_icon: ICONS,
   },
   background: { service_worker: "src/background.js", type: "module" },
   side_panel: { default_path: "index.html" },

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://socialradar.rheav.dev/sitemap-index.xml
